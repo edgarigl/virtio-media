@@ -945,18 +945,25 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
 	 * while we want to other ioctls for this session can be processed and
 	 * potentially trigger dqbuf_wait.
 	 */
-	mutex_unlock(&vv->vlock);
-	ret = wait_event_interruptible(session->dqbuf_wait,
-				       !list_empty(buffer_queue));
-	mutex_lock(&vv->vlock);
-	if (ret)
-		return -EINTR;
+	for (;;) {
+		mutex_unlock(&vv->vlock);
+		ret = wait_event_interruptible(session->dqbuf_wait,
+					       !list_empty(buffer_queue));
+		mutex_lock(&vv->vlock);
+		if (ret)
+			return -EINTR;
 
-	mutex_lock(&session->queues_lock);
-	dqbuf = list_first_entry(buffer_queue, struct virtio_media_buffer,
-				 list);
-	list_del(&dqbuf->list);
-	mutex_unlock(&session->queues_lock);
+		mutex_lock(&session->queues_lock);
+		if (!list_empty(buffer_queue)) {
+			dqbuf = list_first_entry(buffer_queue,
+						 struct virtio_media_buffer,
+						 list);
+			list_del(&dqbuf->list);
+			mutex_unlock(&session->queues_lock);
+			break;
+		}
+		mutex_unlock(&session->queues_lock);
+	}
 
 	/* Clear the DONE flag as the buffer is now being dequeued. */
 	dqbuf->buffer.flags &= ~V4L2_BUF_FLAG_DONE;
