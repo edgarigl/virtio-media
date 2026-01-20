@@ -204,8 +204,12 @@ static int virtio_media_send_wr_ioctl(struct v4l2_fh *fh, u32 ioctl,
 					sizeof(struct virtio_media_resp_ioctl) +
 						minimum_resp_payload,
 					NULL);
-	if (ret < 0)
+	if (ret < 0) {
+		v4l2_err(&vv->v4l2_dev,
+			 "ioctl 0x%x failed in send_command: %d\n",
+			 ioctl, ret);
 		return ret;
+	}
 
 	ret = scatterlist_builder_retrieve_data(&builder, 3, ioctl_data);
 	if (ret) {
