@@ -727,9 +727,8 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
 
 	queue = &session->queues[b->type];
 
-	/* REQBUFS(0) is an implicit STREAMOFF. */
-	if (b->count == 0)
-		virtio_media_clear_queue(session, queue);
+	/* REQBUFS is an implicit STREAMOFF for the queue state. */
+	virtio_media_clear_queue(session, queue);
 
 	vfree(queue->buffers);
 	queue->buffers = NULL;
@@ -791,6 +790,12 @@ static int virtio_media_create_bufs(struct file *file, void *fh,
 	struct virtio_media_session *session = fh_to_session(fh);
 	struct virtio_media_queue_state *queue;
 	struct virtio_media_buffer *buffers;
+	struct virtio_media_buffer *dqbuf;
+	u32 *pending_indices = NULL;
+	size_t pending = 0;
+	size_t old_count;
+	size_t new_count;
+	size_t i;
 	u32 type = b->format.type;
 	int ret;
 
@@ -809,19 +814,50 @@ static int virtio_media_create_bufs(struct file *file, void *fh,
 		return 0;
 
 	buffers = queue->buffers;
+	old_count = queue->allocated_bufs;
+	new_count = b->index + b->count;
+
+	mutex_lock(&session->queues_lock);
+	if (!list_empty(&queue->pending_dqbufs) && old_count) {
+		pending_indices = kcalloc(old_count, sizeof(*pending_indices),
+					  GFP_KERNEL);
+		if (!pending_indices) {
+			mutex_unlock(&session->queues_lock);
+			return -ENOMEM;
+		}
+		list_for_each_entry(dqbuf, &queue->pending_dqbufs, list) {
+			if (pending < old_count)
+				pending_indices[pending++] = dqbuf->buffer.index;
+		}
+	}
 
 	queue->buffers =
-		vzalloc(sizeof(*queue->buffers) * (b->index + b->count));
+		vzalloc(sizeof(*queue->buffers) * new_count);
 	if (!queue->buffers) {
 		queue->buffers = buffers;
+		mutex_unlock(&session->queues_lock);
+		kfree(pending_indices);
 		return -ENOMEM;
 	}
 
 	memcpy(queue->buffers, buffers,
-	       sizeof(*buffers) * queue->allocated_bufs);
+	       sizeof(*buffers) * old_count);
 	vfree(buffers);
 
-	queue->allocated_bufs = b->index + b->count;
+	INIT_LIST_HEAD(&queue->pending_dqbufs);
+	for (i = 0; i < new_count; i++)
+		INIT_LIST_HEAD(&queue->buffers[i].list);
+	for (i = 0; i < pending; i++) {
+		u32 idx = pending_indices[i];
+
+		if (idx < new_count)
+			list_add_tail(&queue->buffers[idx].list,
+				      &queue->pending_dqbufs);
+	}
+
+	queue->allocated_bufs = new_count;
+	mutex_unlock(&session->queues_lock);
+	kfree(pending_indices);
 
 	return 0;
 }
