@@ -449,6 +449,14 @@ static void virtio_media_clear_queue(struct virtio_media_session *session,
 	}
 
 	/* All buffers are now dequeued. */
+	if (!queue->buffers || !queue->allocated_bufs) {
+		queue->queued_bufs = 0;
+		queue->streaming = false;
+		queue->is_capture_last = false;
+		mutex_unlock(&session->queues_lock);
+		return;
+	}
+
 	for (i = 0; i < queue->allocated_bufs; i++)
 		queue->buffers[i].buffer.flags = 0;
 
