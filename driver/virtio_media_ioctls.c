@@ -436,17 +436,11 @@ static int virtio_media_send_ext_controls_ioctl(struct v4l2_fh *fh, u32 ioctl,
 static void virtio_media_clear_queue(struct virtio_media_session *session,
 				     struct virtio_media_queue_state *queue)
 {
-	struct list_head *p, *n;
 	int i;
 
 	mutex_lock(&session->queues_lock);
 
-	list_for_each_safe(p, n, &queue->pending_dqbufs) {
-		struct virtio_media_buffer *dqbuf =
-			list_entry(p, struct virtio_media_buffer, list);
-
-		list_del(&dqbuf->list);
-	}
+	INIT_LIST_HEAD(&queue->pending_dqbufs);
 
 	/* All buffers are now dequeued. */
 	if (!queue->buffers || !queue->allocated_bufs) {
