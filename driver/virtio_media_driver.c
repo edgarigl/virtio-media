@@ -668,6 +668,7 @@ static __poll_t virtio_media_device_poll(struct file *file, poll_table *wait)
 		&session->queues[output_type];
 	__poll_t req_events = poll_requested_events(wait);
 	__poll_t rc = 0;
+	static unsigned int poll_log;
 
 	poll_wait(file, &session->dqbuf_wait, wait);
 	poll_wait(file, &session->fh.wait, wait);
@@ -692,6 +693,13 @@ static __poll_t virtio_media_device_poll(struct file *file, poll_table *wait)
 
 	if (v4l2_event_pending(&session->fh))
 		rc |= EPOLLPRI;
+
+	if ((poll_log++ < 20) || (poll_log % 5000) == 0)
+		v4l2_info(session->fh.vdev->v4l2_dev,
+			  "poll: rc=0x%x cap_stream=%d cap_queued=%zu cap_pending=%d\n",
+			  rc, capture_queue->streaming,
+			  capture_queue->queued_bufs,
+			  !list_empty(&capture_queue->pending_dqbufs));
 
 	return rc;
 }

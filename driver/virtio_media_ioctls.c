@@ -986,6 +986,12 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
 		return -EINVAL;
 	}
 
+	if ((dqbuf_log++ < 20) || (dqbuf_log % 5000) == 0)
+		v4l2_info(&vv->v4l2_dev,
+			  "dqbuf wait: session=%u type=%u queued_bufs=%zu pending=%d\n",
+			  session->id, b->type, queue->queued_bufs,
+			  !list_empty(buffer_queue));
+
 	/*
 	 * vv->lock has been acquired by virtio_media_device_ioctl. Release it
 	 * while we want to other ioctls for this session can be processed and
