@@ -675,9 +675,7 @@ static __poll_t virtio_media_device_poll(struct file *file, poll_table *wait)
 
 	mutex_lock(&session->queues_lock);
 	if (req_events & (EPOLLIN | EPOLLRDNORM)) {
-		if (!capture_queue->streaming ||
-		    (capture_queue->queued_bufs == 0 &&
-		     list_empty(&capture_queue->pending_dqbufs)))
+		if (!capture_queue->streaming)
 			rc |= EPOLLERR;
 		else if (!list_empty(&capture_queue->pending_dqbufs))
 			rc |= EPOLLIN | EPOLLRDNORM;
