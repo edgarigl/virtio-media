@@ -1023,9 +1023,6 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
 		mutex_unlock(&session->queues_lock);
 	}
 
-	/* Clear the DONE flag as the buffer is now being dequeued. */
-	dqbuf->buffer.flags &= ~V4L2_BUF_FLAG_DONE;
-
 	if (is_multiplanar) {
 		size_t nb_planes = min_t(u32, b->length, VIDEO_MAX_PLANES);
 
