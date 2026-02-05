@@ -391,7 +391,10 @@ static int virtio_media_send_event_buffer(struct virtio_media *vv,
 static void eventq_callback(struct virtqueue *queue)
 {
 	struct virtio_media *vv = queue->vdev->priv;
+	static unsigned int evt_cb_log;
 
+	if ((evt_cb_log++ < 20) || (evt_cb_log % 5000) == 0)
+		v4l2_info(&vv->v4l2_dev, "eventq_callback\n");
 	schedule_work(&vv->eventq_work);
 }
 
@@ -408,6 +411,7 @@ virtio_media_process_dqbuf_event(struct virtio_media *vv,
 				 struct virtio_media_session *session,
 				 struct virtio_media_event_dqbuf *dqbuf_evt)
 {
+	static unsigned int dqbuf_evt_log;
 	struct virtio_media_buffer *dqbuf;
 	const enum v4l2_buf_type queue_type = dqbuf_evt->buffer.type;
 	struct virtio_media_queue_state *queue;
@@ -431,6 +435,11 @@ virtio_media_process_dqbuf_event(struct virtio_media *vv,
 	}
 
 	dqbuf = &queue->buffers[dqbuf_evt->buffer.index];
+	if ((dqbuf_evt_log++ < 20) || (dqbuf_evt_log % 5000) == 0)
+		v4l2_info(&vv->v4l2_dev,
+			  "dqbuf event: session=%u type=%u idx=%u queued_bufs=%zu\n",
+			  session->id, dqbuf_evt->buffer.type,
+			  dqbuf_evt->buffer.index, queue->queued_bufs);
 
 	/*
 	 * Preserve the 'm' union that was passed to us during QBUF so userspace
@@ -476,6 +485,7 @@ virtio_media_process_dqbuf_event(struct virtio_media *vv,
  */
 void virtio_media_process_events(struct virtio_media *vv)
 {
+	static unsigned int evt_log;
 	struct virtio_media_event_error *error_evt;
 	struct virtio_media_event_dqbuf *dqbuf_evt;
 	struct virtio_media_event_event *event_evt;
@@ -487,6 +497,10 @@ void virtio_media_process_events(struct virtio_media *vv)
 
 process_bufs:
 	while ((evt = virtqueue_get_buf(vv->eventq, &len))) {
+		if ((evt_log++ < 20) || (evt_log % 5000) == 0)
+			v4l2_info(&vv->v4l2_dev,
+				  "eventq buf len=%u event=%u session=%u\n",
+				  len, evt->event, evt->session_id);
 		/* Make sure we received enough data */
 		if (len < sizeof(*evt)) {
 			v4l2_err(

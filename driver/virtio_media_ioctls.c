@@ -899,11 +899,14 @@ static int virtio_media_prepare_buf(struct file *file, void *fh,
 static int virtio_media_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 {
 	struct virtio_media_session *session = fh_to_session(fh);
+	struct video_device *video_dev = video_devdata(file);
+	struct virtio_media *vv = to_virtio_media(video_dev);
 	struct virtio_media_queue_state *queue;
 	struct virtio_media_buffer *buffer;
 	bool prepared;
 	u32 old_flags;
 	int i, ret;
+	static unsigned int qbuf_log;
 
 	if (b->type > VIRTIO_MEDIA_LAST_QUEUE)
 		return -EINVAL;
@@ -937,6 +940,10 @@ static int virtio_media_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 	}
 
 	queue->queued_bufs += 1;
+	if ((qbuf_log++ < 20) || (qbuf_log % 5000) == 0)
+		v4l2_info(&vv->v4l2_dev,
+			  "qbuf: session=%u type=%u idx=%u queued_bufs=%zu\n",
+			  session->id, b->type, b->index, queue->queued_bufs);
 
 	return 0;
 }
@@ -954,6 +961,7 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
 	struct v4l2_plane *planes_backup = NULL;
 	const bool is_multiplanar = V4L2_TYPE_IS_MULTIPLANAR(b->type);
 	int ret;
+	static unsigned int dqbuf_log;
 
 	if (b->type > VIRTIO_MEDIA_LAST_QUEUE)
 		return -EINVAL;
@@ -998,6 +1006,12 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
 						 list);
 			list_del(&dqbuf->list);
 			mutex_unlock(&session->queues_lock);
+			if ((dqbuf_log++ < 20) || (dqbuf_log % 5000) == 0)
+				v4l2_info(&vv->v4l2_dev,
+					  "dqbuf: session=%u type=%u idx=%u queued_bufs=%zu\n",
+					  session->id, b->type,
+					  dqbuf->buffer.index,
+					  queue->queued_bufs);
 			break;
 		}
 		mutex_unlock(&session->queues_lock);
