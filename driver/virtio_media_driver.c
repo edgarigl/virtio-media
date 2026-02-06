@@ -873,7 +873,8 @@ static int virtio_media_device_mmap(struct file *file,
 		sg_set_buf(&resp_sg, resp_mmap, resp_len);
 		sg_mark_end(&resp_sg);
 
-		ret = virtio_media_send_command(vv, sgs, 1, 1, resp_len, NULL);
+		ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp_mmap),
+						&resp_len);
 		if (ret < 0)
 			goto end;
 
@@ -885,6 +886,10 @@ static int virtio_media_device_mmap(struct file *file,
 		gref_count = le32_to_cpu(resp_mmap->gref_count);
 		gref_domid = le32_to_cpu(resp_mmap->gref_domid);
 		if (!gref_count || gref_count > max_pages) {
+			ret = -EINVAL;
+			goto end;
+		}
+		if (resp_len < sizeof(*resp_mmap) + gref_count * sizeof(u32)) {
 			ret = -EINVAL;
 			goto end;
 		}
@@ -923,10 +928,13 @@ static int virtio_media_device_mmap(struct file *file,
 			map_flags |= GNTMAP_readonly;
 
 		for (i = 0; i < gref_count; i++) {
+			u32 gref_id = ((u32 *)((u8 *)resp_mmap +
+					       sizeof(*resp_mmap)))[i];
+
 			gnttab_set_map_op(&map_ops[i],
 					  (phys_addr_t)page_address(
 						  gref->pages[i]),
-					  map_flags, resp_mmap->gref_ids[i],
+					  map_flags, le32_to_cpu(gref_id),
 					  gref->domid);
 		}
 
