@@ -477,7 +477,14 @@ virtio_media_process_dqbuf_event(struct virtio_media *vv,
 		return;
 	}
 	list_add_tail(&dqbuf->list, &queue->pending_dqbufs);
-	queue->queued_bufs -= 1;
+	if (queue->queued_bufs == 0) {
+		v4l2_warn(&vv->v4l2_dev,
+			  "dqbuf event: queued_bufs already 0 (session=%u type=%u idx=%u)\n",
+			  session->id, dqbuf_evt->buffer.type,
+			  dqbuf_evt->buffer.index);
+	} else {
+		queue->queued_bufs -= 1;
+	}
 	mutex_unlock(&session->queues_lock);
 
 	wake_up(&session->dqbuf_wait);

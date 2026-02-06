@@ -940,6 +940,11 @@ static int virtio_media_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 
 	ret = virtio_media_send_buffer_ioctl(fh, VIDIOC_QBUF, b);
 	if (ret) {
+		v4l2_err(&vv->v4l2_dev,
+			 "qbuf failed: session=%u type=%u idx=%u ret=%d queued_bufs=%zu allocated=%zu streaming=%d\n",
+			 session->id, b->type, b->index, ret,
+			 queue->queued_bufs, queue->allocated_bufs,
+			 queue->streaming);
 		/* Rollback the previous flags as the buffer is not queued. */
 		buffer->buffer.flags = old_flags;
 		return ret;
