@@ -911,6 +911,7 @@ static int virtio_media_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 	struct virtio_media_buffer *buffer;
 	bool prepared;
 	u32 old_flags;
+	bool is_multiplanar = V4L2_TYPE_IS_MULTIPLANAR(b->type);
 	int i, ret;
 	static unsigned int qbuf_log;
 
@@ -940,6 +941,25 @@ static int virtio_media_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 
 	ret = virtio_media_send_buffer_ioctl(fh, VIDIOC_QBUF, b);
 	if (ret) {
+		v4l2_err(&vv->v4l2_dev,
+			 "qbuf failed: memory=%u bytesused=%u length=%u flags=0x%x\n",
+			 b->memory, b->bytesused, b->length, b->flags);
+		if (is_multiplanar) {
+			u32 nb_planes = min_t(u32, b->length, VIDEO_MAX_PLANES);
+
+			for (i = 0; i < nb_planes; i++) {
+				v4l2_err(&vv->v4l2_dev,
+					 "qbuf plane[%u]: mem_offset=0x%x bytesused=%u length=%u data_offset=%u\n",
+					 i, b->m.planes[i].m.mem_offset,
+					 b->m.planes[i].bytesused,
+					 b->m.planes[i].length,
+					 b->m.planes[i].data_offset);
+			}
+		} else {
+			v4l2_err(&vv->v4l2_dev,
+				 "qbuf single: offset=0x%x\n",
+				 b->m.offset);
+		}
 		v4l2_err(&vv->v4l2_dev,
 			 "qbuf failed: session=%u type=%u idx=%u ret=%d queued_bufs=%zu allocated=%zu streaming=%d\n",
 			 session->id, b->type, b->index, ret,
