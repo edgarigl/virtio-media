@@ -15,6 +15,14 @@
  * Virtio protocol definition.
  */
 
+/*
+ * VIRTIO_MEDIA_F_GNTREF - Device can provide Xen grant references for MMAP.
+ *
+ * When negotiated, VIRTIO_MEDIA_CMD_MMAP responses include grant references
+ * so the guest can map buffers as normal RAM without relying on BAR mappings.
+ */
+#define VIRTIO_MEDIA_F_GNTREF 0
+
 /**
  * struct virtio_media_cmd_header - Header for all virtio-media commands.
  * @cmd: one of VIRTIO_MEDIA_CMD_*.
@@ -191,11 +199,21 @@ struct virtio_media_cmd_mmap {
  * @hdr: header containing the status of the command.
  * @driver_addr: offset into SHM region 0 of the start of the mapping.
  * @len: length of the mapping.
+ * @gref_count: number of grant refs following @gref_ids (if negotiated).
+ * @gref_page_size: page size used for each grant ref (bytes).
+ * @gref_domid: domain ID that granted the pages (Xen backend domid).
+ * @__pad: padding for alignment.
+ * @gref_ids: variable-length array of grant references.
  */
 struct virtio_media_resp_mmap {
 	struct virtio_media_resp_header hdr;
 	u64 driver_addr;
 	u64 len;
+	u32 gref_count;
+	u32 gref_page_size;
+	u32 gref_domid;
+	u32 __pad;
+	u32 gref_ids[0];
 };
 
 /**

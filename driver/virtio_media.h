@@ -49,6 +49,7 @@ struct virtio_media {
 	struct work_struct eventq_work;
 
 	struct virtio_shm_region mmap_region;
+	bool use_grefs;
 
 	void *event_buffer;
 
