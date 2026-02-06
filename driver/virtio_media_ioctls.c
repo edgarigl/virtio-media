@@ -453,6 +453,8 @@ static void virtio_media_clear_queue(struct virtio_media_session *session,
 
 	for (i = 0; i < queue->allocated_bufs; i++)
 		queue->buffers[i].buffer.flags = 0;
+	for (i = 0; i < queue->allocated_bufs; i++)
+		INIT_LIST_HEAD(&queue->buffers[i].list);
 
 	queue->queued_bufs = 0;
 	queue->streaming = false;
@@ -736,10 +738,14 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
 	queue->buffers = NULL;
 
 	if (b->count > 0) {
+		int i;
+
 		queue->buffers =
 			vzalloc(sizeof(struct virtio_media_buffer) * b->count);
 		if (!queue->buffers)
 			return -ENOMEM;
+		for (i = 0; i < b->count; i++)
+			INIT_LIST_HEAD(&queue->buffers[i].list);
 	}
 
 	queue->allocated_bufs = b->count;
@@ -1010,7 +1016,7 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
 			dqbuf = list_first_entry(buffer_queue,
 						 struct virtio_media_buffer,
 						 list);
-			list_del(&dqbuf->list);
+			list_del_init(&dqbuf->list);
 			mutex_unlock(&session->queues_lock);
 			if ((dqbuf_log++ < 20) || (dqbuf_log % 5000) == 0)
 				v4l2_info(&vv->v4l2_dev,

@@ -468,6 +468,14 @@ virtio_media_process_dqbuf_event(struct virtio_media *vv,
 	dqbuf->buffer.flags |= V4L2_BUF_FLAG_DONE;
 
 	mutex_lock(&session->queues_lock);
+	if (!list_empty(&dqbuf->list)) {
+		v4l2_warn(&vv->v4l2_dev,
+			  "dqbuf event: buffer already pending (session=%u type=%u idx=%u)\n",
+			  session->id, dqbuf_evt->buffer.type,
+			  dqbuf_evt->buffer.index);
+		mutex_unlock(&session->queues_lock);
+		return;
+	}
 	list_add_tail(&dqbuf->list, &queue->pending_dqbufs);
 	queue->queued_bufs -= 1;
 	mutex_unlock(&session->queues_lock);
