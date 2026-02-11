@@ -21,7 +21,7 @@
  * When negotiated, VIRTIO_MEDIA_CMD_MMAP responses include grant references
  * so the guest can map buffers as normal RAM without relying on BAR mappings.
  */
-#define VIRTIO_MEDIA_F_GNTREF 0
+#define VIRTIO_MEDIA_F_GNTREF 63
 
 /**
  * struct virtio_media_cmd_header - Header for all virtio-media commands.
