@@ -7,6 +7,8 @@
  */
 
 #include <linux/mutex.h>
+#include <linux/scatterlist.h>
+#include <linux/slab.h>
 #include <linux/version.h>
 #include <linux/videodev2.h>
 #include <linux/virtio_config.h>
@@ -315,6 +317,122 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl,
 	}
 
 	return 0;
+}
+
+static int virtio_media_export_buffer(struct v4l2_fh *fh,
+				      struct virtio_media_ioc_export_buffer *e)
+{
+	struct video_device *video_dev = fh->vdev;
+	struct virtio_media *vv = to_virtio_media(video_dev);
+	struct virtio_media_session *session = fh_to_session(fh);
+	struct virtio_media_cmd_export_buffer cmd = {
+		.hdr.cmd = cpu_to_le32(VIRTIO_MEDIA_CMD_EXPORT_BUFFER),
+		.session_id = cpu_to_le32(session->id),
+		.queue_type = cpu_to_le32(e->queue_type),
+		.buffer_index = cpu_to_le32(e->buffer_index),
+		.plane_index = cpu_to_le32(e->plane_index),
+		.flags = cpu_to_le32(e->flags),
+		.__reserved = 0,
+	};
+	struct virtio_media_resp_export_buffer resp = { 0 };
+	struct scatterlist cmd_sg = {};
+	struct scatterlist resp_sg = {};
+	struct scatterlist *sgs[] = { &cmd_sg, &resp_sg };
+	int ret;
+
+	if (!vv->use_export_import)
+		return -EOPNOTSUPP;
+
+	sg_set_buf(&cmd_sg, &cmd, sizeof(cmd));
+	sg_set_buf(&resp_sg, &resp, sizeof(resp));
+	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(resp), NULL);
+	if (ret)
+		return ret;
+
+	e->handle_id = le64_to_cpu(resp.handle_id);
+	e->len = le64_to_cpu(resp.len);
+	e->plane_count = le32_to_cpu(resp.plane_count);
+
+	return 0;
+}
+
+static int virtio_media_import_buffer(struct v4l2_fh *fh,
+				      struct virtio_media_ioc_import_buffer *i)
+{
+	struct video_device *video_dev = fh->vdev;
+	struct virtio_media *vv = to_virtio_media(video_dev);
+	struct virtio_media_session *session = fh_to_session(fh);
+	struct virtio_media_cmd_import_buffer cmd = {
+		.hdr.cmd = cpu_to_le32(VIRTIO_MEDIA_CMD_IMPORT_BUFFER),
+		.session_id = cpu_to_le32(session->id),
+		.flags = cpu_to_le32(i->flags),
+		.handle_id = cpu_to_le64(i->handle_id),
+	};
+	struct virtio_media_resp_import_buffer *resp;
+	struct scatterlist cmd_sg = {};
+	struct scatterlist resp_sg = {};
+	struct scatterlist *sgs[] = { &cmd_sg, &resp_sg };
+	size_t resp_len;
+	size_t max_resp_len;
+	u32 gref_count;
+	int ret;
+
+	if (!vv->use_export_import)
+		return -EOPNOTSUPP;
+
+	max_resp_len = sizeof(*resp) +
+		       sizeof(i->gref_ids[0]) * VIRTIO_MEDIA_MAX_IMPORT_GREFS;
+	resp = kzalloc(max_resp_len, GFP_KERNEL);
+	if (!resp)
+		return -ENOMEM;
+
+	sg_set_buf(&cmd_sg, &cmd, sizeof(cmd));
+	sg_set_buf(&resp_sg, resp, max_resp_len);
+	resp_len = max_resp_len;
+	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp), &resp_len);
+	if (ret)
+		goto out_free;
+
+	gref_count = le32_to_cpu(resp->gref_count);
+	if (gref_count > VIRTIO_MEDIA_MAX_IMPORT_GREFS ||
+	    resp_len < sizeof(*resp) + gref_count * sizeof(u32)) {
+		ret = -EINVAL;
+		goto out_free;
+	}
+
+	i->driver_addr = le64_to_cpu(resp->driver_addr);
+	i->len = le64_to_cpu(resp->len);
+	i->gref_count = gref_count;
+	i->gref_page_size = le32_to_cpu(resp->gref_page_size);
+	i->gref_domid = le32_to_cpu(resp->gref_domid);
+	if (gref_count)
+		memcpy(i->gref_ids, resp->gref_ids, gref_count * sizeof(u32));
+
+out_free:
+	kfree(resp);
+	return ret;
+}
+
+static int virtio_media_release_handle(struct v4l2_fh *fh,
+				       struct virtio_media_ioc_release_handle *r)
+{
+	struct video_device *video_dev = fh->vdev;
+	struct virtio_media *vv = to_virtio_media(video_dev);
+	struct virtio_media_cmd_release_handle cmd = {
+		.hdr.cmd = cpu_to_le32(VIRTIO_MEDIA_CMD_RELEASE_HANDLE),
+		.handle_id = cpu_to_le64(r->handle_id),
+	};
+	struct virtio_media_resp_release_handle resp = { 0 };
+	struct scatterlist cmd_sg = {};
+	struct scatterlist resp_sg = {};
+	struct scatterlist *sgs[] = { &cmd_sg, &resp_sg };
+
+	if (!vv->use_export_import)
+		return -EOPNOTSUPP;
+
+	sg_set_buf(&cmd_sg, &cmd, sizeof(cmd));
+	sg_set_buf(&resp_sg, &resp, sizeof(resp));
+	return virtio_media_send_command(vv, sgs, 1, 1, sizeof(resp), NULL);
 }
 
 /**
@@ -1347,6 +1465,8 @@ long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
 	struct virtio_media *vv = to_virtio_media(video_dev);
 	struct v4l2_fh *vfh = NULL;
 	struct v4l2_standard standard;
+	struct virtio_media_ioc_export_buffer export;
+	struct virtio_media_ioc_release_handle release;
 	v4l2_std_id std_id = 0;
 	int ret;
 
@@ -1393,6 +1513,64 @@ long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
 		ret = copy_to_user((void __user *)arg, &std_id, sizeof(std_id));
 		if (ret)
 			ret = -EINVAL;
+		break;
+	case VIDIOC_VIRTIO_MEDIA_EXPORT_BUFFER:
+		if (!vfh) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = copy_from_user(&export, (void __user *)arg, sizeof(export));
+		if (ret) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = virtio_media_export_buffer(vfh, &export);
+		if (ret)
+			break;
+		ret = copy_to_user((void __user *)arg, &export, sizeof(export));
+		if (ret)
+			ret = -EINVAL;
+		break;
+	case VIDIOC_VIRTIO_MEDIA_IMPORT_BUFFER:
+	{
+		struct virtio_media_ioc_import_buffer *import;
+
+		if (!vfh) {
+			ret = -EINVAL;
+			break;
+		}
+		import = kzalloc(sizeof(*import), GFP_KERNEL);
+		if (!import) {
+			ret = -ENOMEM;
+			break;
+		}
+		ret = copy_from_user(import, (void __user *)arg, sizeof(*import));
+		if (ret) {
+			ret = -EINVAL;
+			goto import_free;
+		}
+		ret = virtio_media_import_buffer(vfh, import);
+		if (ret)
+			goto import_free;
+		ret = copy_to_user((void __user *)arg, import, sizeof(*import));
+		if (ret)
+			ret = -EINVAL;
+import_free:
+		kfree(import);
+		break;
+	}
+	case VIDIOC_VIRTIO_MEDIA_RELEASE_HANDLE:
+		if (!vfh) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = copy_from_user(&release, (void __user *)arg,
+				     sizeof(release));
+		if (ret) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = virtio_media_release_handle(vfh, &release);
 		break;
 	default:
 		ret = video_ioctl2(file, cmd, arg);
