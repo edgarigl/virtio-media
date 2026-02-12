@@ -733,6 +733,7 @@ static int virtio_media_export_buffer(struct v4l2_fh *fh,
 	struct video_device *video_dev = fh->vdev;
 	struct virtio_media *vv = to_virtio_media(video_dev);
 	struct virtio_media_session *session = fh_to_session(fh);
+	static bool heap_desc_notice;
 	struct virtio_media_cmd_export_buffer *cmd;
 	struct virtio_media_resp_export_buffer *resp;
 	struct scatterlist cmd_sg = {};
@@ -742,6 +743,11 @@ static int virtio_media_export_buffer(struct v4l2_fh *fh,
 
 	if (!vv->use_export_import)
 		return -EOPNOTSUPP;
+	if (!heap_desc_notice) {
+		v4l2_info(&vv->v4l2_dev,
+			  "virtio-media: export uses heap-backed command buffers\n");
+		heap_desc_notice = true;
+	}
 
 	/*
 	 * Do not use stack-backed buffers for virtqueue descriptors: on kernels
