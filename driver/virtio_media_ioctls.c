@@ -349,19 +349,35 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl,
 static int virtio_media_release_handle_raw(struct virtio_media *vv,
 					   u64 handle_id)
 {
-	struct virtio_media_cmd_release_handle cmd = {
-		.hdr.cmd = cpu_to_le32(VIRTIO_MEDIA_CMD_RELEASE_HANDLE),
-		.handle_id = cpu_to_le64(handle_id),
-	};
-	struct virtio_media_resp_release_handle resp = { 0 };
+	struct virtio_media_cmd_release_handle *cmd;
+	struct virtio_media_resp_release_handle *resp;
 	struct scatterlist cmd_sg = {};
 	struct scatterlist resp_sg = {};
 	struct scatterlist *sgs[] = { &cmd_sg, &resp_sg };
+	int ret;
 
-	sg_set_buf(&cmd_sg, &cmd, sizeof(cmd));
-	sg_set_buf(&resp_sg, &resp, sizeof(resp));
+	/*
+	 * Use heap-backed command/response buffers so descriptor mapping is safe
+	 * on kernels that use VMAP stack.
+	 */
+	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	resp = kzalloc(sizeof(*resp), GFP_KERNEL);
+	if (!cmd || !resp) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
 
-	return virtio_media_send_command(vv, sgs, 1, 1, sizeof(resp), NULL);
+	cmd->hdr.cmd = cpu_to_le32(VIRTIO_MEDIA_CMD_RELEASE_HANDLE);
+	cmd->handle_id = cpu_to_le64(handle_id);
+	sg_set_buf(&cmd_sg, cmd, sizeof(*cmd));
+	sg_set_buf(&resp_sg, resp, sizeof(*resp));
+
+	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp), NULL);
+
+out_free:
+	kfree(resp);
+	kfree(cmd);
+	return ret;
 }
 
 static int virtio_media_dmabuf_attach(struct dma_buf *dbuf,
@@ -717,16 +733,8 @@ static int virtio_media_export_buffer(struct v4l2_fh *fh,
 	struct video_device *video_dev = fh->vdev;
 	struct virtio_media *vv = to_virtio_media(video_dev);
 	struct virtio_media_session *session = fh_to_session(fh);
-	struct virtio_media_cmd_export_buffer cmd = {
-		.hdr.cmd = cpu_to_le32(VIRTIO_MEDIA_CMD_EXPORT_BUFFER),
-		.session_id = cpu_to_le32(session->id),
-		.queue_type = cpu_to_le32(e->queue_type),
-		.buffer_index = cpu_to_le32(e->buffer_index),
-		.plane_index = cpu_to_le32(e->plane_index),
-		.flags = cpu_to_le32(e->flags),
-		.__reserved = 0,
-	};
-	struct virtio_media_resp_export_buffer resp = { 0 };
+	struct virtio_media_cmd_export_buffer *cmd;
+	struct virtio_media_resp_export_buffer *resp;
 	struct scatterlist cmd_sg = {};
 	struct scatterlist resp_sg = {};
 	struct scatterlist *sgs[] = { &cmd_sg, &resp_sg };
@@ -735,18 +743,40 @@ static int virtio_media_export_buffer(struct v4l2_fh *fh,
 	if (!vv->use_export_import)
 		return -EOPNOTSUPP;
 
-	sg_set_buf(&cmd_sg, &cmd, sizeof(cmd));
-	sg_set_buf(&resp_sg, &resp, sizeof(resp));
-	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(resp), NULL);
-	if (ret)
-		return ret;
+	/*
+	 * Do not use stack-backed buffers for virtqueue descriptors: on kernels
+	 * with VMAP stack this can produce invalid guest addresses.
+	 */
+	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	resp = kzalloc(sizeof(*resp), GFP_KERNEL);
+	if (!cmd || !resp) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
 
-	e->handle_id = le64_to_cpu(resp.handle_id);
-	e->len = le64_to_cpu(resp.len);
-	e->plane_count = le32_to_cpu(resp.plane_count);
+	cmd->hdr.cmd = cpu_to_le32(VIRTIO_MEDIA_CMD_EXPORT_BUFFER);
+	cmd->session_id = cpu_to_le32(session->id);
+	cmd->queue_type = cpu_to_le32(e->queue_type);
+	cmd->buffer_index = cpu_to_le32(e->buffer_index);
+	cmd->plane_index = cpu_to_le32(e->plane_index);
+	cmd->flags = cpu_to_le32(e->flags);
+	cmd->__reserved = 0;
+
+	sg_set_buf(&cmd_sg, cmd, sizeof(*cmd));
+	sg_set_buf(&resp_sg, resp, sizeof(*resp));
+	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp), NULL);
+	if (ret)
+		goto out_free;
+
+	e->handle_id = le64_to_cpu(resp->handle_id);
+	e->len = le64_to_cpu(resp->len);
+	e->plane_count = le32_to_cpu(resp->plane_count);
 	e->dmabuf_fd = -1;
 
-	return 0;
+out_free:
+	kfree(resp);
+	kfree(cmd);
+	return ret;
 }
 
 static int virtio_media_import_buffer(struct v4l2_fh *fh,
@@ -755,12 +785,7 @@ static int virtio_media_import_buffer(struct v4l2_fh *fh,
 	struct video_device *video_dev = fh->vdev;
 	struct virtio_media *vv = to_virtio_media(video_dev);
 	struct virtio_media_session *session = fh_to_session(fh);
-	struct virtio_media_cmd_import_buffer cmd = {
-		.hdr.cmd = cpu_to_le32(VIRTIO_MEDIA_CMD_IMPORT_BUFFER),
-		.session_id = cpu_to_le32(session->id),
-		.flags = cpu_to_le32(i->flags),
-		.handle_id = cpu_to_le64(i->handle_id),
-	};
+	struct virtio_media_cmd_import_buffer *cmd;
 	struct virtio_media_resp_import_buffer *resp;
 	struct scatterlist cmd_sg = {};
 	struct scatterlist resp_sg = {};
@@ -775,11 +800,19 @@ static int virtio_media_import_buffer(struct v4l2_fh *fh,
 
 	max_resp_len = sizeof(*resp) +
 		       sizeof(i->gref_ids[0]) * VIRTIO_MEDIA_MAX_IMPORT_GREFS;
+	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
 	resp = kzalloc(max_resp_len, GFP_KERNEL);
-	if (!resp)
-		return -ENOMEM;
+	if (!cmd || !resp) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
 
-	sg_set_buf(&cmd_sg, &cmd, sizeof(cmd));
+	cmd->hdr.cmd = cpu_to_le32(VIRTIO_MEDIA_CMD_IMPORT_BUFFER);
+	cmd->session_id = cpu_to_le32(session->id);
+	cmd->flags = cpu_to_le32(i->flags);
+	cmd->handle_id = cpu_to_le64(i->handle_id);
+
+	sg_set_buf(&cmd_sg, cmd, sizeof(*cmd));
 	sg_set_buf(&resp_sg, resp, max_resp_len);
 	resp_len = max_resp_len;
 	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp), &resp_len);
@@ -804,6 +837,7 @@ static int virtio_media_import_buffer(struct v4l2_fh *fh,
 
 out_free:
 	kfree(resp);
+	kfree(cmd);
 	return ret;
 }
 
