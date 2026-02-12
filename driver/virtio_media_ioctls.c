@@ -369,8 +369,8 @@ static int virtio_media_release_handle_raw(struct virtio_media *vv,
 
 	cmd->hdr.cmd = cpu_to_le32(VIRTIO_MEDIA_CMD_RELEASE_HANDLE);
 	cmd->handle_id = cpu_to_le64(handle_id);
-	sg_set_buf(&cmd_sg, cmd, sizeof(*cmd));
-	sg_set_buf(&resp_sg, resp, sizeof(*resp));
+	sg_init_one(&cmd_sg, cmd, sizeof(*cmd));
+	sg_init_one(&resp_sg, resp, sizeof(*resp));
 
 	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp), NULL);
 
@@ -768,8 +768,8 @@ static int virtio_media_export_buffer(struct v4l2_fh *fh,
 	cmd->flags = cpu_to_le32(e->flags);
 	cmd->__reserved = 0;
 
-	sg_set_buf(&cmd_sg, cmd, sizeof(*cmd));
-	sg_set_buf(&resp_sg, resp, sizeof(*resp));
+	sg_init_one(&cmd_sg, cmd, sizeof(*cmd));
+	sg_init_one(&resp_sg, resp, sizeof(*resp));
 	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp), NULL);
 	if (ret)
 		goto out_free;
@@ -818,8 +818,8 @@ static int virtio_media_import_buffer(struct v4l2_fh *fh,
 	cmd->flags = cpu_to_le32(i->flags);
 	cmd->handle_id = cpu_to_le64(i->handle_id);
 
-	sg_set_buf(&cmd_sg, cmd, sizeof(*cmd));
-	sg_set_buf(&resp_sg, resp, max_resp_len);
+	sg_init_one(&cmd_sg, cmd, sizeof(*cmd));
+	sg_init_one(&resp_sg, resp, max_resp_len);
 	resp_len = max_resp_len;
 	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp), &resp_len);
 	if (ret)
