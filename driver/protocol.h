@@ -387,7 +387,7 @@ struct virtio_media_event_event {
  *
  * These commands are private to this out-of-tree driver.
  */
-#define VIRTIO_MEDIA_MAX_IMPORT_GREFS 512
+#define VIRTIO_MEDIA_MAX_IMPORT_GREFS 4000
 
 struct virtio_media_ioc_export_buffer {
 	u32 queue_type;
