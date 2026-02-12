@@ -1230,3 +1230,4 @@ MODULE_DEVICE_TABLE(virtio, id_table);
 MODULE_DESCRIPTION("virtio media driver");
 MODULE_AUTHOR("Alexandre Courbot <gnurou@gmail.com>");
 MODULE_LICENSE("Dual BSD/GPL");
+MODULE_IMPORT_NS("DMA_BUF");

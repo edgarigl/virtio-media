@@ -391,7 +391,7 @@ struct virtio_media_ioc_export_buffer {
 	u64 handle_id;
 	u64 len;
 	u32 plane_count;
-	u32 __reserved;
+	s32 dmabuf_fd;
 };
 
 struct virtio_media_ioc_import_buffer {
@@ -403,6 +403,8 @@ struct virtio_media_ioc_import_buffer {
 	u32 __reserved;
 	u64 driver_addr;
 	u64 len;
+	s32 dmabuf_fd;
+	u32 __pad;
 	u32 gref_ids[VIRTIO_MEDIA_MAX_IMPORT_GREFS];
 };
 

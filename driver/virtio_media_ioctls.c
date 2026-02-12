@@ -7,6 +7,7 @@
  */
 
 #include <linux/mutex.h>
+#include <linux/dma-buf.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/version.h>
@@ -18,6 +19,20 @@
 
 #include "scatterlist_builder.h"
 #include "virtio_media.h"
+
+#define VIRTIO_MEDIA_DMABUF_MAGIC 0x564D4442
+
+struct virtio_media_dmabuf {
+	u32 magic;
+	struct virtio_media *vv;
+	u64 handle_id;
+	u64 len;
+	u32 queue_type;
+	u32 buffer_index;
+	u32 plane_index;
+	bool has_binding;
+	bool release_on_close;
+};
 
 /**
  * virtio_media_send_r_ioctl() - Send a read-only ioctl to the device.
@@ -319,6 +334,191 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl,
 	return 0;
 }
 
+static int virtio_media_release_handle_raw(struct virtio_media *vv,
+					   u64 handle_id)
+{
+	struct virtio_media_cmd_release_handle cmd = {
+		.hdr.cmd = cpu_to_le32(VIRTIO_MEDIA_CMD_RELEASE_HANDLE),
+		.handle_id = cpu_to_le64(handle_id),
+	};
+	struct virtio_media_resp_release_handle resp = { 0 };
+	struct scatterlist cmd_sg = {};
+	struct scatterlist resp_sg = {};
+	struct scatterlist *sgs[] = { &cmd_sg, &resp_sg };
+
+	sg_set_buf(&cmd_sg, &cmd, sizeof(cmd));
+	sg_set_buf(&resp_sg, &resp, sizeof(resp));
+
+	return virtio_media_send_command(vv, sgs, 1, 1, sizeof(resp), NULL);
+}
+
+static int virtio_media_dmabuf_attach(struct dma_buf *dbuf,
+				      struct dma_buf_attachment *attach)
+{
+	return -EOPNOTSUPP;
+}
+
+static void virtio_media_dmabuf_detach(struct dma_buf *dbuf,
+				       struct dma_buf_attachment *attach)
+{
+}
+
+static struct sg_table *virtio_media_dmabuf_map(struct dma_buf_attachment *a,
+						enum dma_data_direction dir)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static void virtio_media_dmabuf_unmap(struct dma_buf_attachment *a,
+				      struct sg_table *sgt,
+				      enum dma_data_direction dir)
+{
+}
+
+static void virtio_media_dmabuf_release(struct dma_buf *dbuf)
+{
+	struct virtio_media_dmabuf *vmdb = dbuf->priv;
+
+	if (vmdb->release_on_close && vmdb->vv && vmdb->vv->use_export_import) {
+		mutex_lock(&vmdb->vv->vlock);
+		virtio_media_release_handle_raw(vmdb->vv, vmdb->handle_id);
+		mutex_unlock(&vmdb->vv->vlock);
+	}
+
+	kfree(vmdb);
+}
+
+static const struct dma_buf_ops virtio_media_dmabuf_ops = {
+	.attach = virtio_media_dmabuf_attach,
+	.detach = virtio_media_dmabuf_detach,
+	.map_dma_buf = virtio_media_dmabuf_map,
+	.unmap_dma_buf = virtio_media_dmabuf_unmap,
+	.release = virtio_media_dmabuf_release,
+};
+
+static int virtio_media_dmabuf_create_fd(struct virtio_media *vv,
+					 u64 handle_id, u64 len,
+					 u32 queue_type, u32 buffer_index,
+					 u32 plane_index, bool has_binding,
+					 bool release_on_close, u32 fd_flags)
+{
+	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
+	struct virtio_media_dmabuf *vmdb;
+	struct dma_buf *dbuf;
+	int fd;
+
+	vmdb = kzalloc(sizeof(*vmdb), GFP_KERNEL);
+	if (!vmdb)
+		return -ENOMEM;
+
+	vmdb->magic = VIRTIO_MEDIA_DMABUF_MAGIC;
+	vmdb->vv = vv;
+	vmdb->handle_id = handle_id;
+	vmdb->len = len;
+	vmdb->queue_type = queue_type;
+	vmdb->buffer_index = buffer_index;
+	vmdb->plane_index = plane_index;
+	vmdb->has_binding = has_binding;
+	vmdb->release_on_close = release_on_close;
+
+	exp_info.ops = &virtio_media_dmabuf_ops;
+	exp_info.size = len ? len : 1;
+	exp_info.flags = O_RDWR;
+	exp_info.priv = vmdb;
+	exp_info.exp_name = "virtio-media";
+
+	dbuf = dma_buf_export(&exp_info);
+	if (IS_ERR(dbuf)) {
+		kfree(vmdb);
+		return PTR_ERR(dbuf);
+	}
+
+	fd = dma_buf_fd(dbuf, fd_flags);
+	if (fd < 0)
+		dma_buf_put(dbuf);
+
+	return fd;
+}
+
+static int virtio_media_dmabuf_get_binding(int fd,
+					   struct virtio_media_dmabuf *out)
+{
+	struct dma_buf *dbuf;
+	struct virtio_media_dmabuf *vmdb;
+
+	dbuf = dma_buf_get(fd);
+	if (IS_ERR(dbuf))
+		return PTR_ERR(dbuf);
+
+	vmdb = dbuf->priv;
+	if (!vmdb || vmdb->magic != VIRTIO_MEDIA_DMABUF_MAGIC ||
+	    !vmdb->has_binding) {
+		dma_buf_put(dbuf);
+		return -EINVAL;
+	}
+
+	*out = *vmdb;
+	dma_buf_put(dbuf);
+
+	return 0;
+}
+
+static int virtio_media_dmabuf_to_mmap(struct virtio_media_session *session,
+				       struct v4l2_buffer *mapped)
+{
+	struct virtio_media_queue_state *queue = &session->queues[mapped->type];
+	u32 idx = U32_MAX;
+	u32 planes = 1;
+	int ret;
+	int p;
+
+	if (V4L2_TYPE_IS_MULTIPLANAR(mapped->type)) {
+		if (!mapped->m.planes || !mapped->length ||
+		    mapped->length > VIDEO_MAX_PLANES)
+			return -EINVAL;
+		planes = mapped->length;
+		for (p = 0; p < planes; p++) {
+			struct virtio_media_dmabuf vmdb = { 0 };
+
+			ret = virtio_media_dmabuf_get_binding(
+				mapped->m.planes[p].m.fd, &vmdb);
+			if (ret)
+				return ret;
+			if (vmdb.queue_type != mapped->type ||
+			    vmdb.plane_index != p)
+				return -EINVAL;
+			if (idx == U32_MAX)
+				idx = vmdb.buffer_index;
+			else if (idx != vmdb.buffer_index)
+				return -EINVAL;
+		}
+	} else {
+		struct virtio_media_dmabuf vmdb = { 0 };
+
+		ret = virtio_media_dmabuf_get_binding(mapped->m.fd, &vmdb);
+		if (ret)
+			return ret;
+		if (vmdb.queue_type != mapped->type)
+			return -EINVAL;
+		idx = vmdb.buffer_index;
+	}
+
+	if (idx == U32_MAX || idx >= queue->allocated_bufs)
+		return -EINVAL;
+
+	mapped->memory = V4L2_MEMORY_MMAP;
+	mapped->index = idx;
+	if (V4L2_TYPE_IS_MULTIPLANAR(mapped->type)) {
+		for (p = 0; p < planes; p++)
+			mapped->m.planes[p].m.mem_offset =
+				queue->buffers[idx].planes[p].m.mem_offset;
+	} else {
+		mapped->m.offset = queue->buffers[idx].buffer.m.offset;
+	}
+
+	return 0;
+}
+
 static int virtio_media_export_buffer(struct v4l2_fh *fh,
 				      struct virtio_media_ioc_export_buffer *e)
 {
@@ -352,6 +552,7 @@ static int virtio_media_export_buffer(struct v4l2_fh *fh,
 	e->handle_id = le64_to_cpu(resp.handle_id);
 	e->len = le64_to_cpu(resp.len);
 	e->plane_count = le32_to_cpu(resp.plane_count);
+	e->dmabuf_fd = -1;
 
 	return 0;
 }
@@ -405,6 +606,7 @@ static int virtio_media_import_buffer(struct v4l2_fh *fh,
 	i->gref_count = gref_count;
 	i->gref_page_size = le32_to_cpu(resp->gref_page_size);
 	i->gref_domid = le32_to_cpu(resp->gref_domid);
+	i->dmabuf_fd = -1;
 	if (gref_count)
 		memcpy(i->gref_ids, resp->gref_ids, gref_count * sizeof(u32));
 
@@ -418,21 +620,11 @@ static int virtio_media_release_handle(struct v4l2_fh *fh,
 {
 	struct video_device *video_dev = fh->vdev;
 	struct virtio_media *vv = to_virtio_media(video_dev);
-	struct virtio_media_cmd_release_handle cmd = {
-		.hdr.cmd = cpu_to_le32(VIRTIO_MEDIA_CMD_RELEASE_HANDLE),
-		.handle_id = cpu_to_le64(r->handle_id),
-	};
-	struct virtio_media_resp_release_handle resp = { 0 };
-	struct scatterlist cmd_sg = {};
-	struct scatterlist resp_sg = {};
-	struct scatterlist *sgs[] = { &cmd_sg, &resp_sg };
 
 	if (!vv->use_export_import)
 		return -EOPNOTSUPP;
 
-	sg_set_buf(&cmd_sg, &cmd, sizeof(cmd));
-	sg_set_buf(&resp_sg, &resp, sizeof(resp));
-	return virtio_media_send_command(vv, sgs, 1, 1, sizeof(resp), NULL);
+	return virtio_media_release_handle_raw(vv, r->handle_id);
 }
 
 /**
@@ -832,6 +1024,8 @@ static int virtio_media_streamoff(struct file *file, void *fh,
 static int virtio_media_reqbufs(struct file *file, void *fh,
 				struct v4l2_requestbuffers *b)
 {
+	struct video_device *video_dev = video_devdata(file);
+	struct virtio_media *vv = to_virtio_media(video_dev);
 	struct virtio_media_session *session = fh_to_session(fh);
 	struct virtio_media_queue_state *queue;
 	int ret;
@@ -878,8 +1072,8 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
 	if (!virtio_media_allow_userptr)
 		b->capabilities &= ~V4L2_BUF_CAP_SUPPORTS_USERPTR;
 
-	/* We do not support DMABUF yet. */
-	b->capabilities &= ~V4L2_BUF_CAP_SUPPORTS_DMABUF;
+	if (!vv->use_export_import)
+		b->capabilities &= ~V4L2_BUF_CAP_SUPPORTS_DMABUF;
 
 	return 0;
 }
@@ -907,6 +1101,46 @@ static int virtio_media_querybuf(struct file *file, void *fh,
 	/* Set the DONE flag if the buffer is waiting in our own dequeue queue. */
 	b->flags |= (buffer->buffer.flags & V4L2_BUF_FLAG_DONE);
 
+	return 0;
+}
+
+static int virtio_media_expbuf(struct file *file, void *fh,
+			       struct v4l2_exportbuffer *exp)
+{
+	struct video_device *video_dev = video_devdata(file);
+	struct virtio_media *vv = to_virtio_media(video_dev);
+	struct virtio_media_ioc_export_buffer export = {
+		.queue_type = exp->type,
+		.buffer_index = exp->index,
+		.plane_index = exp->plane,
+		.flags = exp->flags,
+		.dmabuf_fd = -1,
+	};
+	int fd_flags = (exp->flags & O_CLOEXEC) ? O_CLOEXEC : 0;
+	int ret;
+
+	if (!vv->use_export_import)
+		return -EOPNOTSUPP;
+	if (exp->type > VIRTIO_MEDIA_LAST_QUEUE)
+		return -EINVAL;
+
+	ret = virtio_media_export_buffer(fh, &export);
+	if (ret)
+		return ret;
+
+	export.dmabuf_fd = virtio_media_dmabuf_create_fd(
+		vv, export.handle_id, export.len, export.queue_type,
+		export.buffer_index, export.plane_index, true, true, fd_flags);
+	if (export.dmabuf_fd < 0) {
+		struct virtio_media_ioc_release_handle release = {
+			.handle_id = export.handle_id,
+		};
+
+		virtio_media_release_handle(fh, &release);
+		return export.dmabuf_fd;
+	}
+
+	exp->fd = export.dmabuf_fd;
 	return 0;
 }
 
@@ -1027,18 +1261,39 @@ static int virtio_media_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 	struct virtio_media *vv = to_virtio_media(video_dev);
 	struct virtio_media_queue_state *queue;
 	struct virtio_media_buffer *buffer;
+	struct v4l2_buffer host_b = *b;
+	struct v4l2_plane host_planes[VIDEO_MAX_PLANES];
 	bool prepared;
 	u32 old_flags;
 	bool is_multiplanar = V4L2_TYPE_IS_MULTIPLANAR(b->type);
+	u32 host_index;
 	int i, ret;
 	static unsigned int qbuf_log;
 
 	if (b->type > VIRTIO_MEDIA_LAST_QUEUE)
 		return -EINVAL;
 	queue = &session->queues[b->type];
-	if (b->index >= queue->allocated_bufs)
+
+	if (is_multiplanar) {
+		u32 nb_planes = min_t(u32, b->length, VIDEO_MAX_PLANES);
+
+		if (!b->m.planes || !nb_planes)
+			return -EINVAL;
+		memcpy(host_planes, b->m.planes,
+		       nb_planes * sizeof(host_planes[0]));
+		host_b.m.planes = host_planes;
+	}
+
+	if (b->memory == V4L2_MEMORY_DMABUF) {
+		ret = virtio_media_dmabuf_to_mmap(session, &host_b);
+		if (ret)
+			return ret;
+	}
+
+	host_index = host_b.index;
+	if (host_index >= queue->allocated_bufs)
 		return -EINVAL;
-	buffer = &queue->buffers[b->index];
+	buffer = &queue->buffers[host_index];
 	prepared = buffer->buffer.flags & V4L2_BUF_FLAG_PREPARED;
 
 	/*
@@ -1057,30 +1312,32 @@ static int virtio_media_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 	old_flags = buffer->buffer.flags;
 	buffer->buffer.flags = V4L2_BUF_FLAG_QUEUED;
 
-	ret = virtio_media_send_buffer_ioctl(fh, VIDIOC_QBUF, b);
+	ret = virtio_media_send_buffer_ioctl(fh, VIDIOC_QBUF, &host_b);
 	if (ret) {
 		v4l2_err(&vv->v4l2_dev,
 			 "qbuf failed: memory=%u bytesused=%u length=%u flags=0x%x\n",
-			 b->memory, b->bytesused, b->length, b->flags);
+			 host_b.memory, host_b.bytesused, host_b.length,
+			 host_b.flags);
 		if (is_multiplanar) {
-			u32 nb_planes = min_t(u32, b->length, VIDEO_MAX_PLANES);
+			u32 nb_planes = min_t(u32, host_b.length,
+					      VIDEO_MAX_PLANES);
 
 			for (i = 0; i < nb_planes; i++) {
 				v4l2_err(&vv->v4l2_dev,
 					 "qbuf plane[%u]: mem_offset=0x%x bytesused=%u length=%u data_offset=%u\n",
-					 i, b->m.planes[i].m.mem_offset,
-					 b->m.planes[i].bytesused,
-					 b->m.planes[i].length,
-					 b->m.planes[i].data_offset);
+					 i, host_b.m.planes[i].m.mem_offset,
+					 host_b.m.planes[i].bytesused,
+					 host_b.m.planes[i].length,
+					 host_b.m.planes[i].data_offset);
 			}
 		} else {
 			v4l2_err(&vv->v4l2_dev,
 				 "qbuf single: offset=0x%x\n",
-				 b->m.offset);
+				 host_b.m.offset);
 		}
 		v4l2_err(&vv->v4l2_dev,
 			 "qbuf failed: session=%u type=%u idx=%u ret=%d queued_bufs=%zu allocated=%zu streaming=%d\n",
-			 session->id, b->type, b->index, ret,
+			 session->id, b->type, host_index, ret,
 			 queue->queued_bufs, queue->allocated_bufs,
 			 queue->streaming);
 		/* Rollback the previous flags as the buffer is not queued. */
@@ -1092,7 +1349,7 @@ static int virtio_media_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 	if ((qbuf_log++ < 20) || (qbuf_log % 5000) == 0)
 		v4l2_info(&vv->v4l2_dev,
 			  "qbuf: session=%u type=%u idx=%u queued_bufs=%zu\n",
-			  session->id, b->type, b->index, queue->queued_bufs);
+			  session->id, b->type, host_index, queue->queued_bufs);
 
 	return 0;
 }
@@ -1348,7 +1605,7 @@ const struct v4l2_ioctl_ops virtio_media_ioctl_ops = {
 	.vidioc_reqbufs = virtio_media_reqbufs,
 	.vidioc_querybuf = virtio_media_querybuf,
 	.vidioc_qbuf = virtio_media_qbuf,
-	.vidioc_expbuf = NULL,
+	.vidioc_expbuf = virtio_media_expbuf,
 	.vidioc_dqbuf = virtio_media_dqbuf,
 	.vidioc_create_bufs = virtio_media_create_bufs,
 	.vidioc_prepare_buf = virtio_media_prepare_buf,
@@ -1527,6 +1784,14 @@ long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
 		ret = virtio_media_export_buffer(vfh, &export);
 		if (ret)
 			break;
+		export.dmabuf_fd = virtio_media_dmabuf_create_fd(
+			vv, export.handle_id, export.len, export.queue_type,
+			export.buffer_index, export.plane_index, true, false,
+			O_CLOEXEC);
+		if (export.dmabuf_fd < 0) {
+			ret = export.dmabuf_fd;
+			break;
+		}
 		ret = copy_to_user((void __user *)arg, &export, sizeof(export));
 		if (ret)
 			ret = -EINVAL;
@@ -1552,6 +1817,13 @@ long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
 		ret = virtio_media_import_buffer(vfh, import);
 		if (ret)
 			goto import_free;
+		import->dmabuf_fd = virtio_media_dmabuf_create_fd(
+			vv, import->handle_id, import->len, 0, 0, 0, false,
+			false, O_CLOEXEC);
+		if (import->dmabuf_fd < 0) {
+			ret = import->dmabuf_fd;
+			goto import_free;
+		}
 		ret = copy_to_user((void __user *)arg, import, sizeof(*import));
 		if (ret)
 			ret = -EINVAL;
