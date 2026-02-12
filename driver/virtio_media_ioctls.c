@@ -801,6 +801,24 @@ static int virtio_media_import_buffer(struct v4l2_fh *fh,
 	u32 gref_count;
 	int ret;
 
+	/*
+	 * Direct-gref import path: userspace provides grant metadata obtained
+	 * out-of-band (e.g. from another guest), so no command is sent to QEMU.
+	 */
+	if (i->flags & VIRTIO_MEDIA_IMPORT_F_DIRECT_GREFS) {
+		if (!i->gref_count || i->gref_count > VIRTIO_MEDIA_MAX_IMPORT_GREFS)
+			return -EINVAL;
+		if (i->gref_page_size != PAGE_SIZE)
+			return -EINVAL;
+		if (!i->len)
+			i->len = (u64)i->gref_count * PAGE_SIZE;
+		if (i->len > (u64)i->gref_count * PAGE_SIZE)
+			return -EINVAL;
+		i->driver_addr = 0;
+		i->dmabuf_fd = -1;
+		return 0;
+	}
+
 	if (!vv->use_export_import)
 		return -EOPNOTSUPP;
 

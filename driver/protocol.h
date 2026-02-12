@@ -408,6 +408,13 @@ struct virtio_media_ioc_import_buffer {
 	u32 gref_ids[VIRTIO_MEDIA_MAX_IMPORT_GREFS];
 };
 
+/*
+ * When set by userspace on VIDIOC_VIRTIO_MEDIA_IMPORT_BUFFER, import grefs
+ * directly from the ioctl payload instead of resolving handle_id through QEMU.
+ * This is used for cross-guest sharing where handle namespaces differ.
+ */
+#define VIRTIO_MEDIA_IMPORT_F_DIRECT_GREFS (1U << 0)
+
 struct virtio_media_ioc_release_handle {
 	u64 handle_id;
 };
