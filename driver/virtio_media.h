@@ -52,6 +52,7 @@ struct virtio_media {
 	bool use_grefs;
 	bool use_export_import;
 	bool use_share_fence;
+	bool use_peer_gref_import;
 
 	void *event_buffer;
 

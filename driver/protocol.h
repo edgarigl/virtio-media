@@ -37,6 +37,12 @@
  */
 #define VIRTIO_MEDIA_F_SHARE_FENCE 61
 
+/*
+ * VIRTIO_MEDIA_F_PEER_GREF_IMPORT - Device can broker grant refs for a
+ * specific peer Xen domid when importing a shared handle.
+ */
+#define VIRTIO_MEDIA_F_PEER_GREF_IMPORT 60
+
 /**
  * struct virtio_media_cmd_header - Header for all virtio-media commands.
  * @cmd: one of VIRTIO_MEDIA_CMD_*.
@@ -414,6 +420,13 @@ struct virtio_media_ioc_import_buffer {
  * This is used for cross-guest sharing where handle namespaces differ.
  */
 #define VIRTIO_MEDIA_IMPORT_F_DIRECT_GREFS (1U << 0)
+/*
+ * Request QEMU to return grant refs targeted to a peer domid encoded in the
+ * import flags. This path still sends VIRTIO_MEDIA_CMD_IMPORT_BUFFER.
+ */
+#define VIRTIO_MEDIA_IMPORT_F_TARGET_DOMID (1U << 1)
+#define VIRTIO_MEDIA_IMPORT_DOMID_SHIFT 16
+#define VIRTIO_MEDIA_IMPORT_DOMID_MASK 0xffffU
 
 struct virtio_media_ioc_release_handle {
 	u64 handle_id;

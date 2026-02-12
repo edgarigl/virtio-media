@@ -799,6 +799,7 @@ static int virtio_media_import_buffer(struct v4l2_fh *fh,
 	size_t resp_len;
 	size_t max_resp_len;
 	u32 gref_count;
+	u32 cmd_flags;
 	int ret;
 
 	/*
@@ -822,6 +823,16 @@ static int virtio_media_import_buffer(struct v4l2_fh *fh,
 	if (!vv->use_export_import)
 		return -EOPNOTSUPP;
 
+	cmd_flags = i->flags;
+	if (i->flags & VIRTIO_MEDIA_IMPORT_F_TARGET_DOMID) {
+		if (!vv->use_peer_gref_import)
+			return -EOPNOTSUPP;
+		if (i->gref_domid > VIRTIO_MEDIA_IMPORT_DOMID_MASK)
+			return -EINVAL;
+		cmd_flags |= (i->gref_domid & VIRTIO_MEDIA_IMPORT_DOMID_MASK)
+			     << VIRTIO_MEDIA_IMPORT_DOMID_SHIFT;
+	}
+
 	max_resp_len = sizeof(*resp) +
 		       sizeof(i->gref_ids[0]) * VIRTIO_MEDIA_MAX_IMPORT_GREFS;
 	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
@@ -833,7 +844,7 @@ static int virtio_media_import_buffer(struct v4l2_fh *fh,
 
 	cmd->hdr.cmd = cpu_to_le32(VIRTIO_MEDIA_CMD_IMPORT_BUFFER);
 	cmd->session_id = cpu_to_le32(session->id);
-	cmd->flags = cpu_to_le32(i->flags);
+	cmd->flags = cpu_to_le32(cmd_flags);
 	cmd->handle_id = cpu_to_le64(i->handle_id);
 
 	sg_init_one(&cmd_sg, cmd, sizeof(*cmd));
