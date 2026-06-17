@@ -23,6 +23,7 @@
 #include <linux/virtio.h>
 #include <linux/virtio_config.h>
 #include <linux/virtio_ids.h>
+#include <xen/grant_table.h>
 
 #include <media/frame_vector.h>
 #include <media/v4l2-dev.h>
@@ -394,7 +395,10 @@ static int virtio_media_send_event_buffer(struct virtio_media *vv,
 static void eventq_callback(struct virtqueue *queue)
 {
 	struct virtio_media *vv = queue->vdev->priv;
+	static unsigned int evt_cb_log;
 
+	if ((evt_cb_log++ < 20) || (evt_cb_log % 5000) == 0)
+		v4l2_info(&vv->v4l2_dev, "eventq_callback\n");
 	schedule_work(&vv->eventq_work);
 }
 
@@ -411,6 +415,7 @@ virtio_media_process_dqbuf_event(struct virtio_media *vv,
 				 struct virtio_media_session *session,
 				 struct virtio_media_event_dqbuf *dqbuf_evt)
 {
+	static unsigned int dqbuf_evt_log;
 	struct virtio_media_buffer *dqbuf;
 	const enum v4l2_buf_type queue_type = dqbuf_evt->buffer.type;
 	struct virtio_media_queue_state *queue;
@@ -434,6 +439,11 @@ virtio_media_process_dqbuf_event(struct virtio_media *vv,
 	}
 
 	dqbuf = &queue->buffers[dqbuf_evt->buffer.index];
+	if ((dqbuf_evt_log++ < 20) || (dqbuf_evt_log % 5000) == 0)
+		v4l2_info(&vv->v4l2_dev,
+			  "dqbuf event: session=%u type=%u idx=%u queued_bufs=%zu\n",
+			  session->id, dqbuf_evt->buffer.type,
+			  dqbuf_evt->buffer.index, queue->queued_bufs);
 
 	/*
 	 * Preserve the 'm' union that was passed to us during QBUF so userspace
@@ -460,8 +470,23 @@ virtio_media_process_dqbuf_event(struct virtio_media *vv,
 	dqbuf->buffer.flags |= V4L2_BUF_FLAG_DONE;
 
 	mutex_lock(&session->queues_lock);
+	if (!list_empty(&dqbuf->list)) {
+		v4l2_warn(&vv->v4l2_dev,
+			  "dqbuf event: buffer already pending (session=%u type=%u idx=%u)\n",
+			  session->id, dqbuf_evt->buffer.type,
+			  dqbuf_evt->buffer.index);
+		mutex_unlock(&session->queues_lock);
+		return;
+	}
 	list_add_tail(&dqbuf->list, &queue->pending_dqbufs);
-	queue->queued_bufs -= 1;
+	if (queue->queued_bufs == 0) {
+		v4l2_warn(&vv->v4l2_dev,
+			  "dqbuf event: queued_bufs already 0 (session=%u type=%u idx=%u)\n",
+			  session->id, dqbuf_evt->buffer.type,
+			  dqbuf_evt->buffer.index);
+	} else {
+		queue->queued_bufs -= 1;
+	}
 	mutex_unlock(&session->queues_lock);
 
 	wake_up(&session->dqbuf_wait);
@@ -478,6 +503,7 @@ virtio_media_process_dqbuf_event(struct virtio_media *vv,
  */
 void virtio_media_process_events(struct virtio_media *vv)
 {
+	static unsigned int evt_log;
 	struct virtio_media_event_error *error_evt;
 	struct virtio_media_event_dqbuf *dqbuf_evt;
 	struct virtio_media_event_event *event_evt;
@@ -489,6 +515,10 @@ void virtio_media_process_events(struct virtio_media *vv)
 
 process_bufs:
 	while ((evt = virtqueue_get_buf(vv->eventq, &len))) {
+		if ((evt_log++ < 20) || (evt_log % 5000) == 0)
+			v4l2_info(&vv->v4l2_dev,
+				  "eventq buf len=%u event=%u session=%u\n",
+				  len, evt->event, evt->session_id);
 		/* Make sure we received enough data */
 		if (len < sizeof(*evt)) {
 			v4l2_err(&vv->v4l2_dev,
@@ -652,15 +682,14 @@ static __poll_t virtio_media_device_poll(struct file *file, poll_table *wait)
 		&session->queues[output_type];
 	__poll_t req_events = poll_requested_events(wait);
 	__poll_t rc = 0;
+	static unsigned int poll_log;
 
 	poll_wait(file, &session->dqbuf_wait, wait);
 	poll_wait(file, &session->fh.wait, wait);
 
 	mutex_lock(&session->queues_lock);
 	if (req_events & (EPOLLIN | EPOLLRDNORM)) {
-		if (!capture_queue->streaming ||
-		    (capture_queue->queued_bufs == 0 &&
-		     list_empty(&capture_queue->pending_dqbufs)))
+		if (!capture_queue->streaming)
 			rc |= EPOLLERR;
 		else if (!list_empty(&capture_queue->pending_dqbufs))
 			rc |= EPOLLIN | EPOLLRDNORM;
@@ -677,16 +706,39 @@ static __poll_t virtio_media_device_poll(struct file *file, poll_table *wait)
 	if (v4l2_event_pending(&session->fh))
 		rc |= EPOLLPRI;
 
+	if ((poll_log++ < 20) || (poll_log % 5000) == 0)
+		v4l2_info(session->fh.vdev->v4l2_dev,
+			  "poll: rc=0x%x cap_stream=%d cap_queued=%zu cap_pending=%d\n",
+			  rc, capture_queue->streaming,
+			  capture_queue->queued_bufs,
+			  !list_empty(&capture_queue->pending_dqbufs));
+
 	return rc;
 }
 
+struct virtio_media_gref_mapping {
+	struct page **pages;
+	grant_handle_t *handles;
+	unsigned int count;
+	domid_t domid;
+};
+
+struct virtio_media_vma {
+	struct virtio_media *vv;
+	struct virtio_media_session *session;
+	struct virtio_media_gref_mapping *gref;
+	u64 driver_addr;
+};
+
 static void virtio_media_vma_close_locked(struct vm_area_struct *vma)
 {
-	struct virtio_media *vv = vma->vm_private_data;
+	struct virtio_media_vma *vma_data = vma->vm_private_data;
+	struct virtio_media *vv = vma_data->vv;
 	struct virtio_media_cmd_munmap *cmd_munmap = &vv->cmd.munmap;
 	struct virtio_media_resp_munmap *resp_munmap = &vv->resp.munmap;
 	struct scatterlist cmd_sg = {}, resp_sg = {};
 	struct scatterlist *sgs[2] = { &cmd_sg, &resp_sg };
+	struct virtio_media_gref_mapping *gref = vma_data->gref;
 	int ret;
 
 	sg_set_buf(&cmd_sg, cmd_munmap, sizeof(*cmd_munmap));
@@ -696,14 +748,46 @@ static void virtio_media_vma_close_locked(struct vm_area_struct *vma)
 	sg_mark_end(&resp_sg);
 
 	cmd_munmap->hdr.cmd = VIRTIO_MEDIA_CMD_MUNMAP;
-	cmd_munmap->driver_addr =
-		(vma->vm_pgoff << PAGE_SHIFT) - vv->mmap_region.addr;
+	cmd_munmap->driver_addr = vma_data->driver_addr;
 	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp_munmap),
 					NULL);
 	if (ret < 0) {
 		v4l2_err(&vv->v4l2_dev, "host failed to unmap buffer: %d\n",
 			 ret);
 	}
+
+	if (gref) {
+		struct gnttab_unmap_grant_ref *unmap_ops;
+		unsigned int i;
+
+		unmap_ops = kcalloc(gref->count, sizeof(*unmap_ops),
+				    GFP_KERNEL);
+			if (unmap_ops) {
+				for (i = 0; i < gref->count; i++) {
+					if (gref->handles[i] ==
+					    INVALID_GRANT_HANDLE) {
+						continue;
+					}
+					gnttab_set_unmap_op(
+						&unmap_ops[i],
+						(phys_addr_t)page_address(
+							gref->pages[i]),
+						GNTMAP_host_map, gref->handles[i]);
+			}
+			gnttab_unmap_refs(unmap_ops, NULL, gref->pages,
+					  gref->count);
+			kfree(unmap_ops);
+		} else {
+			v4l2_err(&vv->v4l2_dev,
+				 "gref unmap allocation failed\n");
+		}
+
+		gnttab_free_pages(gref->count, gref->pages);
+		kfree(gref->handles);
+		kfree(gref);
+	}
+
+	kfree(vma_data);
 }
 
 /**
@@ -715,7 +799,8 @@ static void virtio_media_vma_close_locked(struct vm_area_struct *vma)
  */
 static void virtio_media_vma_close(struct vm_area_struct *vma)
 {
-	struct virtio_media *vv = vma->vm_private_data;
+	struct virtio_media_vma *vma_data = vma->vm_private_data;
+	struct virtio_media *vv = vma_data->vv;
 
 	mutex_lock(&vv->vlock);
 	virtio_media_vma_close_locked(vma);
@@ -742,10 +827,16 @@ static int virtio_media_device_mmap(struct file *file,
 	struct virtio_media_session *session =
 		fh_to_session(file->private_data);
 	struct virtio_media_cmd_mmap *cmd_mmap = &session->cmd.mmap;
-	struct virtio_media_resp_mmap *resp_mmap = &session->resp.mmap;
+	struct virtio_media_resp_mmap *resp_mmap = NULL;
 	struct scatterlist cmd_sg = {}, resp_sg = {};
 	struct scatterlist *sgs[2] = { &cmd_sg, &resp_sg };
+	struct virtio_media_vma *vma_data = NULL;
+	struct virtio_media_gref_mapping *gref = NULL;
+	struct gnttab_map_grant_ref *map_ops = NULL;
 	int ret;
+	size_t resp_len;
+	unsigned int i;
+	bool pages_allocated = false;
 
 	if (!(vma->vm_flags & VM_SHARED))
 		return -EINVAL;
@@ -753,6 +844,14 @@ static int virtio_media_device_mmap(struct file *file,
 		return -EINVAL;
 
 	mutex_lock(&vv->vlock);
+
+	vma_data = kzalloc(sizeof(*vma_data), GFP_KERNEL);
+	if (!vma_data) {
+		ret = -ENOMEM;
+		goto end;
+	}
+	vma_data->vv = vv;
+	vma_data->session = session;
 
 	cmd_mmap->hdr.cmd = VIRTIO_MEDIA_CMD_MMAP;
 	cmd_mmap->session_id = session->id;
@@ -763,49 +862,201 @@ static int virtio_media_device_mmap(struct file *file,
 	sg_set_buf(&cmd_sg, cmd_mmap, sizeof(*cmd_mmap));
 	sg_mark_end(&cmd_sg);
 
-	sg_set_buf(&resp_sg, resp_mmap, sizeof(*resp_mmap));
-	sg_mark_end(&resp_sg);
-
 	/*
 	 * The host performs reference counting and is smart enough to return
 	 * the same guest physical address if this is called several times on
 	 * the same
 	 * buffer.
 	 */
-	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp_mmap),
-					NULL);
-	if (ret < 0)
-		goto end;
+	if (vv->use_grefs) {
+		/* Xen grant references map buffers as normal RAM (no BAR IO). */
+		unsigned int max_pages;
+		size_t vma_len = vma->vm_end - vma->vm_start;
+		u32 gref_count;
+		u32 gref_domid;
+		u32 map_flags;
 
-	vma->vm_private_data = vv;
-	/*
-	 * Keep the guest address at which the buffer is mapped since we will
-	 * use that to unmap.
-	 */
-	vma->vm_pgoff = (resp_mmap->driver_addr + vv->mmap_region.addr) >>
-			PAGE_SHIFT;
+		max_pages = DIV_ROUND_UP(vma_len, PAGE_SIZE);
+		resp_len = sizeof(*resp_mmap) + max_pages * sizeof(u32);
+		resp_mmap = kzalloc(resp_len, GFP_KERNEL);
+		if (!resp_mmap) {
+			ret = -ENOMEM;
+			goto end;
+		}
 
-	/*
-	 * We cannot let the mapping be larger than the buffer.
-	 */
-	if (vma->vm_end - vma->vm_start > PAGE_ALIGN(resp_mmap->len)) {
-		dev_dbg(&video_dev->dev,
-			"invalid MMAP, as it would overflow buffer length\n");
-		virtio_media_vma_close_locked(vma);
-		ret = -EINVAL;
-		goto end;
+		sg_set_buf(&resp_sg, resp_mmap, resp_len);
+		sg_mark_end(&resp_sg);
+
+		ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp_mmap),
+						&resp_len);
+		if (ret < 0)
+			goto end;
+
+		if (le32_to_cpu(resp_mmap->hdr.status)) {
+			ret = -EIO;
+			goto end;
+		}
+
+		gref_count = le32_to_cpu(resp_mmap->gref_count);
+		gref_domid = le32_to_cpu(resp_mmap->gref_domid);
+		if (!gref_count || gref_count > max_pages) {
+			ret = -EINVAL;
+			goto end;
+		}
+		if (resp_len < sizeof(*resp_mmap) + gref_count * sizeof(u32)) {
+			ret = -EINVAL;
+			goto end;
+		}
+		if (le32_to_cpu(resp_mmap->gref_page_size) != PAGE_SIZE) {
+			ret = -EINVAL;
+			goto end;
+		}
+
+		gref = kzalloc(sizeof(*gref), GFP_KERNEL);
+		if (!gref) {
+			ret = -ENOMEM;
+			goto end;
+		}
+		gref->count = gref_count;
+		gref->domid = gref_domid;
+		gref->pages = kcalloc(gref_count, sizeof(*gref->pages),
+				      GFP_KERNEL);
+		gref->handles = kcalloc(gref_count, sizeof(*gref->handles),
+					GFP_KERNEL);
+		map_ops = kcalloc(gref_count, sizeof(*map_ops), GFP_KERNEL);
+		if (!gref->pages || !gref->handles || !map_ops) {
+			ret = -ENOMEM;
+			goto end;
+		}
+
+		if (gnttab_alloc_pages(gref_count, gref->pages)) {
+			ret = -ENOMEM;
+			goto end;
+		}
+		pages_allocated = true;
+		for (i = 0; i < gref_count; i++)
+			gref->handles[i] = INVALID_GRANT_HANDLE;
+
+		map_flags = GNTMAP_host_map;
+		if (!(vma->vm_flags & VM_WRITE))
+			map_flags |= GNTMAP_readonly;
+
+		for (i = 0; i < gref_count; i++) {
+			u32 gref_id = ((u32 *)((u8 *)resp_mmap +
+					       sizeof(*resp_mmap)))[i];
+
+			gnttab_set_map_op(&map_ops[i],
+					  (phys_addr_t)page_address(
+						  gref->pages[i]),
+					  map_flags, le32_to_cpu(gref_id),
+					  gref->domid);
+		}
+
+		ret = gnttab_map_refs(map_ops, NULL, gref->pages, gref_count);
+		for (i = 0; i < gref_count; i++) {
+			if (map_ops[i].status == GNTST_okay) {
+				gref->handles[i] = map_ops[i].handle;
+				continue;
+			}
+			ret = -ENXIO;
+			goto end;
+		}
+
+		vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP | VM_MIXEDMAP);
+		for (i = 0; i < gref_count; i++) {
+			ret = vm_insert_page(vma, vma->vm_start +
+					     i * PAGE_SIZE, gref->pages[i]);
+			if (ret)
+				goto end;
+		}
+
+		vma_data->gref = gref;
+		vma_data->driver_addr = le64_to_cpu(resp_mmap->driver_addr);
+		vma->vm_ops = &virtio_media_vm_ops;
+		vma->vm_private_data = vma_data;
+	} else {
+		resp_mmap = &session->resp.mmap;
+		resp_len = sizeof(*resp_mmap);
+		sg_set_buf(&resp_sg, resp_mmap, resp_len);
+		sg_mark_end(&resp_sg);
+
+		/*
+		 * Without VIRTIO_MEDIA_F_GNTREF the device replies with only the
+		 * base {hdr, driver_addr, len}; do not require the grant fields.
+		 */
+		ret = virtio_media_send_command(vv, sgs, 1, 1,
+						VIRTIO_MEDIA_RESP_MMAP_BASE_SIZE,
+						NULL);
+		if (ret < 0)
+			goto end;
+
+		vma_data->driver_addr = le64_to_cpu(resp_mmap->driver_addr);
+		vma->vm_private_data = vma_data;
+		/*
+		 * Keep the guest address at which the buffer is mapped since we
+		 * will use that to unmap.
+		 */
+		vma->vm_pgoff = (resp_mmap->driver_addr +
+				 vv->mmap_region.addr) >> PAGE_SHIFT;
+
+		/*
+		 * We cannot let the mapping be larger than the buffer.
+		 */
+		if (vma->vm_end - vma->vm_start >
+		    PAGE_ALIGN(le64_to_cpu(resp_mmap->len))) {
+			dev_dbg(&video_dev->dev,
+				"invalid MMAP, as it would overflow buffer length\n");
+			virtio_media_vma_close_locked(vma);
+			ret = -EINVAL;
+			goto end;
+		}
+
+		ret = io_remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
+					 vma->vm_end - vma->vm_start,
+					 vma->vm_page_prot);
+		if (ret)
+			goto end;
+
+		vma->vm_ops = &virtio_media_vm_ops;
 	}
-
-	ret = io_remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
-				 vma->vm_end - vma->vm_start,
-				 vma->vm_page_prot);
-	if (ret)
-		goto end;
-
-	vma->vm_ops = &virtio_media_vm_ops;
 
 end:
 	mutex_unlock(&vv->vlock);
+	if (ret) {
+		if (gref) {
+			struct gnttab_unmap_grant_ref *unmap_ops;
+
+			unmap_ops = kcalloc(gref->count, sizeof(*unmap_ops),
+					    GFP_KERNEL);
+			if (unmap_ops) {
+				for (i = 0; i < gref->count; i++) {
+					if (gref->handles[i] ==
+					    INVALID_GRANT_HANDLE) {
+						continue;
+					}
+					gnttab_set_unmap_op(
+						&unmap_ops[i],
+						(phys_addr_t)page_address(
+							gref->pages[i]),
+						GNTMAP_host_map,
+						gref->handles[i]);
+				}
+				gnttab_unmap_refs(unmap_ops, NULL,
+						  gref->pages, gref->count);
+				kfree(unmap_ops);
+			}
+			if (pages_allocated)
+				gnttab_free_pages(gref->count, gref->pages);
+			kfree(gref->handles);
+			kfree(gref);
+		}
+		kfree(vma_data);
+		if (vv->use_grefs)
+			kfree(resp_mmap);
+	}
+	if (vv->use_grefs && !ret)
+		kfree(resp_mmap);
+	kfree(map_ops);
 	return ret;
 }
 
@@ -882,9 +1133,13 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 	vv->eventq = vqs[1];
 	INIT_WORK(&vv->eventq_work, virtio_media_event_work);
 
-	/* Get MMAP buffer mapping SHM region */
-	virtio_get_shm_region(virtio_dev, &vv->mmap_region,
-			      VIRTIO_MEDIA_SHM_MMAP);
+	/* Use grant references when the device advertises the feature. */
+	vv->use_grefs = virtio_has_feature(virtio_dev, VIRTIO_MEDIA_F_GNTREF);
+	if (!vv->use_grefs) {
+		/* Get MMAP buffer mapping SHM region */
+		virtio_get_shm_region(virtio_dev, &vv->mmap_region,
+				      VIRTIO_MEDIA_SHM_MMAP);
+	}
 
 	vd = &vv->video_dev;
 
@@ -956,7 +1211,9 @@ static struct virtio_device_id id_table[] = {
 	{ 0 },
 };
 
-static unsigned int features[] = {};
+static unsigned int features[] = {
+	VIRTIO_MEDIA_F_GNTREF,
+};
 
 static struct virtio_driver virtio_media_driver = {
 	.feature_table = features,
