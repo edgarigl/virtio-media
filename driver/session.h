@@ -18,6 +18,13 @@
 #define VIRTIO_MEDIA_LAST_QUEUE (V4L2_BUF_TYPE_META_OUTPUT)
 
 /*
+ * Upper bound on the number of buffers a queue may have. Used to sanity-check
+ * device-supplied counts (REQBUFS/CREATE_BUFS) before sizing allocations.
+ * VIDEO_MAX_FRAME is the V4L2 per-queue maximum.
+ */
+#define VIRTIO_MEDIA_MAX_BUFFERS VIDEO_MAX_FRAME
+
+/*
  * Size of the per-session virtio shadow and event buffers. 16K should be
  * enough to contain everything we need.
  */
@@ -86,6 +93,13 @@ struct virtio_media_session {
 	u32 id;
 	bool nonblocking_dequeue;
 	bool uses_mplane;
+	/*
+	 * Set when the device reports an unrecoverable error for this session
+	 * via the event queue. The session is kept alive (freed only when its
+	 * file is closed) but all further operations fail. Protected by the
+	 * device events_lock for writes from the event path.
+	 */
+	bool dead;
 
 	union {
 		struct virtio_media_cmd_close close;

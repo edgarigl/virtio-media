@@ -179,7 +179,17 @@ static int virtio_media_session_close(struct virtio_media *vv,
 	if (ret < 0)
 		return ret;
 
+	/*
+	 * Serialize against the event worker, which may still hold a pointer
+	 * to this session (looked up via virtio_media_find_session) while
+	 * processing a batch of events. Taking events_lock guarantees the
+	 * worker is not inside process_events touching this session when we
+	 * free it. session_free() also removes it from the session list, so a
+	 * subsequent lookup cannot find it.
+	 */
+	mutex_lock(&vv->events_lock);
 	virtio_media_session_free(vv, session);
+	mutex_unlock(&vv->events_lock);
 
 	return 0;
 }
@@ -220,6 +230,13 @@ virtio_media_find_session(struct virtio_media *vv, u32 id)
 struct virtio_media_cmd_callback_param {
 	struct virtio_media *vv;
 	bool done;
+	/*
+	 * Set by the waiter (under vv->cmd_lock) when it gives up waiting (e.g.
+	 * on timeout). The descriptor is still in flight, so the param must
+	 * outlive the waiter's stack frame: when abandoned, the callback frees
+	 * it on late completion instead of touching the waiter.
+	 */
+	bool abandoned;
 	size_t resp_len;
 };
 
@@ -233,12 +250,27 @@ static void commandq_callback(struct virtqueue *queue)
 {
 	unsigned int len;
 	struct virtio_media_cmd_callback_param *param;
+	struct virtio_media *vv = queue->vdev->priv;
+	unsigned long flags;
 
 process_bufs:
 	while ((param = virtqueue_get_buf(queue, &len))) {
-		param->done = true;
-		param->resp_len = len;
-		wake_up(&param->vv->wq);
+		bool abandoned;
+
+		spin_lock_irqsave(&vv->cmd_lock, flags);
+		abandoned = param->abandoned;
+		if (!abandoned) {
+			param->done = true;
+			param->resp_len = len;
+		}
+		spin_unlock_irqrestore(&vv->cmd_lock, flags);
+
+		if (abandoned) {
+			/* Waiter is gone; we own the param now. */
+			kfree(param);
+			continue;
+		}
+		wake_up(&vv->wq);
 	}
 
 	if (!virtqueue_enable_cb(queue)) {
@@ -262,44 +294,77 @@ static int virtio_media_kick_command(struct virtio_media *vv,
 				     const size_t out_sgs, const size_t in_sgs,
 				     size_t *resp_len)
 {
-	struct virtio_media_cmd_callback_param cb_param = {
-		.vv = vv,
-		.done = false,
-		.resp_len = 0,
-	};
+	struct virtio_media_cmd_callback_param *cb_param;
 	struct virtio_media_resp_header *resp_header;
+	unsigned long flags;
+	size_t local_resp_len;
+	bool completed;
 	int ret;
 
-	ret = virtqueue_add_sgs(vv->commandq, sgs, out_sgs, in_sgs, &cb_param,
+	cb_param = kzalloc(sizeof(*cb_param), GFP_KERNEL);
+	if (!cb_param)
+		return -ENOMEM;
+	cb_param->vv = vv;
+
+	ret = virtqueue_add_sgs(vv->commandq, sgs, out_sgs, in_sgs, cb_param,
 				GFP_ATOMIC);
 	if (ret) {
 		v4l2_err(&vv->v4l2_dev,
 			 "failed to add sgs to command virtqueue\n");
+		kfree(cb_param);
 		return ret;
 	}
 
 	if (!virtqueue_kick(vv->commandq)) {
 		v4l2_err(&vv->v4l2_dev, "failed to kick command virtqueue\n");
+		/*
+		 * The descriptor may or may not be in flight; treat it like a
+		 * timeout and let the callback reclaim the param if it ever
+		 * completes.
+		 */
+		spin_lock_irqsave(&vv->cmd_lock, flags);
+		cb_param->abandoned = true;
+		completed = cb_param->done;
+		spin_unlock_irqrestore(&vv->cmd_lock, flags);
+		if (completed)
+			kfree(cb_param);
 		return -EINVAL;
 	}
 
 	/* Wait for the response. */
-	ret = wait_event_timeout(vv->wq, cb_param.done, 5 * HZ);
+	ret = wait_event_timeout(vv->wq, cb_param->done, 5 * HZ);
 	if (ret == 0) {
-		v4l2_err(&vv->v4l2_dev,
-			 "timed out waiting for response to command\n");
-		return -ETIMEDOUT;
+		/*
+		 * The descriptor is still in flight with cb_param as its token.
+		 * Mark it abandoned so a late completion frees it rather than
+		 * writing through freed memory. Re-check done under the lock in
+		 * case the callback fired between the wait and here.
+		 */
+		spin_lock_irqsave(&vv->cmd_lock, flags);
+		completed = cb_param->done;
+		if (!completed)
+			cb_param->abandoned = true;
+		spin_unlock_irqrestore(&vv->cmd_lock, flags);
+		if (!completed) {
+			v4l2_err(&vv->v4l2_dev,
+				 "timed out waiting for response to command\n");
+			return -ETIMEDOUT;
+		}
 	}
 
+	/* Command completed: the callback will not touch cb_param again. */
+	local_resp_len = cb_param->resp_len;
+	kfree(cb_param);
+
 	if (resp_len)
-		*resp_len = cb_param.resp_len;
+		*resp_len = local_resp_len;
 
 	if (in_sgs > 0) {
 		/*
 		 * If we expect a response, make sure we have at least a
 		 * response header - anything shorter is invalid.
 		 */
-		if (cb_param.resp_len < sizeof(*resp_header)) {
+		if (local_resp_len < sizeof(*resp_header)) {
 			v4l2_err(&vv->v4l2_dev,
 				 "received response header is too short\n");
 			return -EINVAL;
@@ -546,7 +611,14 @@ process_bufs:
 			v4l2_err(&vv->v4l2_dev,
 				 "received error %d for session %d",
 				 error_evt->errno, error_evt->hdr.session_id);
-			virtio_media_session_close(vv, session);
+			/*
+			 * Do not free the session from the event path: its file
+			 * may still be open and a DQBUF may be blocked on it
+			 * with vv->vlock dropped. Mark it dead and wake any
+			 * waiters; the session is freed when its file is closed.
+			 */
+			session->dead = true;
+			wake_up_interruptible_all(&session->dqbuf_wait);
 			break;
 
 		/*
@@ -953,14 +1025,20 @@ static int virtio_media_device_mmap(struct file *file,
 		}
 
 		ret = gnttab_map_refs(map_ops, NULL, gref->pages, gref_count);
+		/*
+		 * gnttab_map_refs processes the whole batch, so record every
+		 * successfully mapped handle before bailing. Otherwise a grant
+		 * that mapped after the first failure would be leaked, since the
+		 * cleanup path only unmaps entries with a valid handle.
+		 */
 		for (i = 0; i < gref_count; i++) {
-			if (map_ops[i].status == GNTST_okay) {
+			if (map_ops[i].status == GNTST_okay)
 				gref->handles[i] = map_ops[i].handle;
-				continue;
-			}
-			ret = -ENXIO;
-			goto end;
+			else
+				ret = -ENXIO;
 		}
+		if (ret)
+			goto end;
 
 		vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP | VM_MIXEDMAP);
 		for (i = 0; i < gref_count; i++) {
@@ -1111,6 +1189,7 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 	mutex_init(&vv->sessions_lock);
 	mutex_init(&vv->events_lock);
 	mutex_init(&vv->vlock);
+	spin_lock_init(&vv->cmd_lock);
 
 	vv->virtio_dev = virtio_dev;
 	virtio_dev->priv = vv;

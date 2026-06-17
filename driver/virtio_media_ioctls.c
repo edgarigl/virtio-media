@@ -1334,6 +1334,13 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
 	if (ret)
 		return ret;
 
+	/*
+	 * The count is written back by the (untrusted) device. Bound it before
+	 * using it to size an allocation, to avoid overflow / unbounded vzalloc.
+	 */
+	if (b->count > VIRTIO_MEDIA_MAX_BUFFERS)
+		return -EINVAL;
+
 	queue = &session->queues[b->type];
 
 	/* REQBUFS is an implicit STREAMOFF for the queue state. */
@@ -1393,10 +1400,13 @@ static int virtio_media_querybuf(struct file *file, void *fh,
 
 	buffer = &queue->buffers[b->index];
 	/*
-	 * Set the DONE flag if the buffer is waiting in our own dequeue
-	 * queue.
+	 * Reflect the buffer's tracked queue state (QUEUED/PREPARED/DONE) so
+	 * QUERYBUF reports it correctly, as required by the V4L2 API. The host
+	 * proxy does not track this per-buffer, so we own it here.
 	 */
-	b->flags |= (buffer->buffer.flags & V4L2_BUF_FLAG_DONE);
+	b->flags |= (buffer->buffer.flags &
+		     (V4L2_BUF_FLAG_QUEUED | V4L2_BUF_FLAG_PREPARED |
+		      V4L2_BUF_FLAG_DONE));
 
 	return 0;
 }
@@ -1471,6 +1481,16 @@ static int virtio_media_create_bufs(struct file *file, void *fh,
 	/* If count is zero, we were just checking for format. */
 	if (b->count == 0)
 		return 0;
+
+	/*
+	 * b->index and b->count come back from the (untrusted) device. Bound
+	 * the resulting count before sizing the allocation to avoid u32
+	 * overflow / unbounded vzalloc.
+	 */
+	if (b->count > VIRTIO_MEDIA_MAX_BUFFERS ||
+	    b->index > VIRTIO_MEDIA_MAX_BUFFERS ||
+	    (u64)b->index + b->count > VIRTIO_MEDIA_MAX_BUFFERS)
+		return -EINVAL;
 
 	buffers = queue->buffers;
 	old_count = queue->allocated_bufs;
@@ -1652,6 +1672,14 @@ static int virtio_media_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 			  "qbuf: session=%u type=%u idx=%u queued_bufs=%zu\n",
 			  session->id, b->type, host_index, queue->queued_bufs);
 
+	/*
+	 * Reflect the resulting buffer state back to userspace. In particular
+	 * this drops any client-supplied flags we do not honour (e.g. cache
+	 * hints) and reports the buffer as QUEUED with a monotonic timestamp
+	 * source, as required by the V4L2 API.
+	 */
+	b->flags = V4L2_BUF_FLAG_QUEUED | V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+
 	return 0;
 }
 
@@ -1707,10 +1735,13 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
 	for (;;) {
 		mutex_unlock(&vv->vlock);
 		ret = wait_event_interruptible(session->dqbuf_wait,
-					       !list_empty(buffer_queue));
+					       !list_empty(buffer_queue) ||
+					       session->dead);
 		mutex_lock(&vv->vlock);
 		if (ret)
 			return -EINTR;
+		if (session->dead)
+			return -ENODEV;
 
 		mutex_lock(&session->queues_lock);
 		if (!list_empty(buffer_queue)) {
@@ -1733,6 +1764,9 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
 	if (is_multiplanar) {
 		size_t nb_planes = min_t(u32, b->length, VIDEO_MAX_PLANES);
 
+		if (!b->m.planes || b->length == 0)
+			return -EINVAL;
+
 		memcpy(b->m.planes, dqbuf->planes,
 		       nb_planes * sizeof(struct v4l2_plane));
 		planes_backup = b->m.planes;
@@ -1742,6 +1776,14 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
 
 	if (is_multiplanar)
 		b->m.planes = planes_backup;
+
+	/*
+	 * The buffer is no longer owned by the driver once dequeued: clear the
+	 * QUEUED/PREPARED/DONE state bits, which are only valid while the buffer
+	 * is in a queue. The V4L2 API requires DQBUF to not report DONE.
+	 */
+	b->flags &= ~(V4L2_BUF_FLAG_QUEUED | V4L2_BUF_FLAG_PREPARED |
+		      V4L2_BUF_FLAG_DONE);
 
 	if (V4L2_TYPE_IS_CAPTURE(b->type) && b->flags & V4L2_BUF_FLAG_LAST)
 		queue->is_capture_last = true;

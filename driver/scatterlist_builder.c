@@ -171,7 +171,7 @@ int scatterlist_builder_retrieve_data(struct scatterlist_builder *builder,
 
 	if (kaddr >= shadow_buf &&
 	    kaddr < shadow_buf + VIRTIO_SHADOW_BUF_SIZE) {
-		if (kaddr + sg->length >= shadow_buf + VIRTIO_SHADOW_BUF_SIZE)
+		if (kaddr + sg->length > shadow_buf + VIRTIO_SHADOW_BUF_SIZE)
 			return -EINVAL;
 
 		memcpy(data, kaddr, sg->length);

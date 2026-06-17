@@ -9,6 +9,7 @@
 #ifndef __VIRTIO_MEDIA_H
 #define __VIRTIO_MEDIA_H
 
+#include <linux/spinlock.h>
 #include <linux/virtio_config.h>
 #include <media/v4l2-device.h>
 
@@ -75,6 +76,12 @@ struct virtio_media {
 
 	struct mutex vlock; /* serializes command queue access */
 	wait_queue_head_t wq;
+	/*
+	 * Protects the commandq callback param handshake (see
+	 * struct virtio_media_cmd_callback_param) against a late completion
+	 * racing a timed-out waiter.
+	 */
+	spinlock_t cmd_lock;
 };
 
 static inline struct virtio_media *
