@@ -1135,6 +1135,12 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 
 	/* Use grant references when the device advertises the feature. */
 	vv->use_grefs = virtio_has_feature(virtio_dev, VIRTIO_MEDIA_F_GNTREF);
+	vv->use_export_import =
+		virtio_has_feature(virtio_dev, VIRTIO_MEDIA_F_EXPORT_IMPORT);
+	vv->use_share_fence =
+		virtio_has_feature(virtio_dev, VIRTIO_MEDIA_F_SHARE_FENCE);
+	vv->use_peer_gref_import =
+		virtio_has_feature(virtio_dev, VIRTIO_MEDIA_F_PEER_GREF_IMPORT);
 	if (!vv->use_grefs) {
 		/* Get MMAP buffer mapping SHM region */
 		virtio_get_shm_region(virtio_dev, &vv->mmap_region,
@@ -1213,6 +1219,9 @@ static struct virtio_device_id id_table[] = {
 
 static unsigned int features[] = {
 	VIRTIO_MEDIA_F_GNTREF,
+	VIRTIO_MEDIA_F_EXPORT_IMPORT,
+	VIRTIO_MEDIA_F_SHARE_FENCE,
+	VIRTIO_MEDIA_F_PEER_GREF_IMPORT,
 };
 
 static struct virtio_driver virtio_media_driver = {
@@ -1231,3 +1240,4 @@ MODULE_DEVICE_TABLE(virtio, id_table);
 MODULE_DESCRIPTION("virtio media driver");
 MODULE_AUTHOR("Alexandre Courbot <gnurou@gmail.com>");
 MODULE_LICENSE("Dual BSD/GPL");
+MODULE_IMPORT_NS("DMA_BUF");

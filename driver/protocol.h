@@ -24,6 +24,26 @@
  */
 #define VIRTIO_MEDIA_F_GNTREF 63
 
+/*
+ * VIRTIO_MEDIA_F_EXPORT_IMPORT - Device supports brokered export/import of
+ * capture buffers through explicit commands.
+ */
+#define VIRTIO_MEDIA_F_EXPORT_IMPORT 62
+
+/*
+ * VIRTIO_MEDIA_F_SHARE_FENCE - Device supports explicit fence metadata for
+ * shared buffers.
+ *
+ * This bit is currently negotiated only for forward compatibility.
+ */
+#define VIRTIO_MEDIA_F_SHARE_FENCE 61
+
+/*
+ * VIRTIO_MEDIA_F_PEER_GREF_IMPORT - Device can broker grant refs for a
+ * specific peer Xen domid when importing a shared handle.
+ */
+#define VIRTIO_MEDIA_F_PEER_GREF_IMPORT 60
+
 /**
  * struct virtio_media_cmd_header - Header for all virtio-media commands.
  * @cmd: one of VIRTIO_MEDIA_CMD_*.
@@ -242,6 +262,68 @@ struct virtio_media_resp_munmap {
 	struct virtio_media_resp_header hdr;
 };
 
+/*
+ * VIRTIO_MEDIA_CMD_EXPORT_BUFFER - Export a local capture buffer and obtain an
+ * opaque handle that can be shared with another guest.
+ */
+#define VIRTIO_MEDIA_CMD_EXPORT_BUFFER 6
+
+struct virtio_media_cmd_export_buffer {
+	struct virtio_media_cmd_header hdr;
+	u32 session_id;
+	u32 queue_type;
+	u32 buffer_index;
+	u32 plane_index;
+	u32 flags;
+	u32 __reserved;
+};
+
+struct virtio_media_resp_export_buffer {
+	struct virtio_media_resp_header hdr;
+	u64 handle_id;
+	u64 len;
+	u32 plane_count;
+	u32 __reserved;
+};
+
+/*
+ * VIRTIO_MEDIA_CMD_IMPORT_BUFFER - Import an opaque handle previously exported
+ * by another guest and retrieve mapping metadata.
+ */
+#define VIRTIO_MEDIA_CMD_IMPORT_BUFFER 7
+
+struct virtio_media_cmd_import_buffer {
+	struct virtio_media_cmd_header hdr;
+	u32 session_id;
+	u32 flags;
+	u64 handle_id;
+};
+
+struct virtio_media_resp_import_buffer {
+	struct virtio_media_resp_header hdr;
+	u64 driver_addr;
+	u64 len;
+	u32 gref_count;
+	u32 gref_page_size;
+	u32 gref_domid;
+	u32 __pad;
+	u32 gref_ids[0];
+};
+
+/*
+ * VIRTIO_MEDIA_CMD_RELEASE_HANDLE - Release a previously exported handle.
+ */
+#define VIRTIO_MEDIA_CMD_RELEASE_HANDLE 8
+
+struct virtio_media_cmd_release_handle {
+	struct virtio_media_cmd_header hdr;
+	u64 handle_id;
+};
+
+struct virtio_media_resp_release_handle {
+	struct virtio_media_resp_header hdr;
+};
+
 /* The values for these events are set by the virtio-media specification. */
 #define VIRTIO_MEDIA_EVT_ERROR 0
 #define VIRTIO_MEDIA_EVT_DQBUF 1
@@ -306,9 +388,67 @@ struct virtio_media_event_event {
 	struct v4l2_event event;
 };
 
-/* Maximum size of an event. We will queue descriptors of this size on the
- * eventq.
+/*
+ * Userspace prototype ioctls for brokered sharing.
+ *
+ * These commands are private to this out-of-tree driver.
  */
+#define VIRTIO_MEDIA_MAX_IMPORT_GREFS 4000
+
+struct virtio_media_ioc_export_buffer {
+	u32 queue_type;
+	u32 buffer_index;
+	u32 plane_index;
+	u32 flags;
+	u64 handle_id;
+	u64 len;
+	u32 plane_count;
+	s32 dmabuf_fd;
+};
+
+struct virtio_media_ioc_import_buffer {
+	u64 handle_id;
+	u32 flags;
+	u32 gref_count;
+	u32 gref_page_size;
+	u32 gref_domid;
+	u32 __reserved;
+	u64 driver_addr;
+	u64 len;
+	s32 dmabuf_fd;
+	u32 __pad;
+	u32 gref_ids[VIRTIO_MEDIA_MAX_IMPORT_GREFS];
+};
+
+/*
+ * When set by userspace on VIDIOC_VIRTIO_MEDIA_IMPORT_BUFFER, import grefs
+ * directly from the ioctl payload instead of resolving handle_id through QEMU.
+ * This is used for cross-guest sharing where handle namespaces differ.
+ */
+#define VIRTIO_MEDIA_IMPORT_F_DIRECT_GREFS (1U << 0)
+/*
+ * Request QEMU to return grant refs targeted to a peer domid encoded in the
+ * import flags. This path still sends VIRTIO_MEDIA_CMD_IMPORT_BUFFER.
+ */
+#define VIRTIO_MEDIA_IMPORT_F_TARGET_DOMID (1U << 1)
+#define VIRTIO_MEDIA_IMPORT_DOMID_SHIFT 16
+#define VIRTIO_MEDIA_IMPORT_DOMID_MASK 0xffffU
+
+struct virtio_media_ioc_release_handle {
+	u64 handle_id;
+};
+
+#define VIDIOC_VIRTIO_MEDIA_EXPORT_BUFFER \
+	_IOWR('V', BASE_VIDIOC_PRIVATE + 0, \
+	      struct virtio_media_ioc_export_buffer)
+#define VIDIOC_VIRTIO_MEDIA_IMPORT_BUFFER \
+	_IOWR('V', BASE_VIDIOC_PRIVATE + 1, \
+	      struct virtio_media_ioc_import_buffer)
+#define VIDIOC_VIRTIO_MEDIA_RELEASE_HANDLE \
+	_IOWR('V', BASE_VIDIOC_PRIVATE + 2, \
+	      struct virtio_media_ioc_release_handle)
+
+/* Maximum size of an event. We will queue descriptors of this size on the eventq. */
 #define VIRTIO_MEDIA_EVENT_MAX_SIZE sizeof(struct virtio_media_event_dqbuf)
 
 #endif // __VIRTIO_MEDIA_PROTOCOL_H
