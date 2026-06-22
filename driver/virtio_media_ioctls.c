@@ -14,6 +14,8 @@
 #include <linux/version.h>
 #include <linux/videodev2.h>
 #include <linux/virtio_config.h>
+#include <linux/virtio_dma_buf.h>
+#include <linux/uuid.h>
 #include <linux/vmalloc.h>
 #include <xen/grant_table.h>
 #include <media/v4l2-event.h>
@@ -1516,6 +1518,39 @@ static int virtio_media_prepare_buf(struct file *file, void *fh,
 	return 0;
 }
 
+static int virtio_media_register_import_buffer(struct virtio_media *vv,
+					       struct virtio_media_session *session,
+					       u32 index, const u8 *uuid)
+{
+	struct virtio_media_cmd_register_buffer *cmd;
+	struct virtio_media_resp_register_buffer *resp;
+	struct scatterlist cmd_sg = {};
+	struct scatterlist resp_sg = {};
+	struct scatterlist *sgs[] = { &cmd_sg, &resp_sg };
+	int ret;
+
+	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	resp = kzalloc(sizeof(*resp), GFP_KERNEL);
+	if (!cmd || !resp) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	cmd->hdr.cmd = VIRTIO_MEDIA_CMD_REGISTER_BUFFER;
+	cmd->session_id = session->id;
+	cmd->buffer_index = index;
+	memcpy(cmd->uuid, uuid, sizeof(cmd->uuid));
+	sg_init_one(&cmd_sg, cmd, sizeof(*cmd));
+	sg_init_one(&resp_sg, resp, sizeof(*resp));
+
+	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp), NULL);
+	if (ret >= 0)
+		ret = (s32)le32_to_cpu(resp->hdr.status);
+out:
+	kfree(cmd);
+	kfree(resp);
+	return ret;
+}
+
 static int virtio_media_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 {
 	struct virtio_media_session *session = fh_to_session(fh);
@@ -1547,9 +1582,46 @@ static int virtio_media_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 	}
 
 	if (b->memory == V4L2_MEMORY_DMABUF) {
-		ret = virtio_media_dmabuf_to_mmap(session, &host_b);
-		if (ret)
-			return ret;
+		struct dma_buf *dbuf = (vv->use_import && !is_multiplanar) ?
+			dma_buf_get(b->m.fd) : ERR_PTR(-EINVAL);
+
+		if (!IS_ERR_OR_NULL(dbuf) && is_virtio_dma_buf(dbuf)) {
+			uuid_t uuid;
+			struct virtio_media_buffer *ibuf =
+				(b->index < queue->allocated_bufs) ?
+					&queue->buffers[b->index] : NULL;
+
+			ret = virtio_dma_buf_get_uuid(dbuf, &uuid);
+			dma_buf_put(dbuf);
+			if (ret)
+				return ret;
+			/*
+			 * Only register the buffer with the host the first time
+			 * this index is queued (or if its dma-buf UUID changed).
+			 * The UUID->host-fd binding is fixed for the buffer's
+			 * lifetime, so re-sending REGISTER_BUFFER on every QBUF
+			 * is a wasted virtqueue round-trip.  The cache resets with
+			 * the buffers array on REQBUFS, matching the host.
+			 */
+			if (!ibuf || !ibuf->imported ||
+			    !uuid_equal(&ibuf->imported_uuid, &uuid)) {
+				ret = virtio_media_register_import_buffer(
+					vv, session, b->index, uuid.b);
+				if (ret)
+					return ret;
+				if (ibuf) {
+					uuid_copy(&ibuf->imported_uuid, &uuid);
+					ibuf->imported = true;
+				}
+			}
+			/* host_b stays DMABUF at b->index; QEMU resolves m.fd */
+		} else {
+			if (!IS_ERR_OR_NULL(dbuf))
+				dma_buf_put(dbuf);
+			ret = virtio_media_dmabuf_to_mmap(session, &host_b);
+			if (ret)
+				return ret;
+		}
 	}
 
 	host_index = host_b.index;

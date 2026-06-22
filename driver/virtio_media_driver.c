@@ -1135,6 +1135,8 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 		virtio_has_feature(virtio_dev, VIRTIO_MEDIA_F_SHARE_FENCE);
 	vv->use_peer_gref_import =
 		virtio_has_feature(virtio_dev, VIRTIO_MEDIA_F_PEER_GREF_IMPORT);
+	vv->use_import =
+		virtio_has_feature(virtio_dev, VIRTIO_MEDIA_F_IMPORT_BUFFER);
 	if (!vv->use_grefs) {
 		/* Get MMAP buffer mapping SHM region */
 		virtio_get_shm_region(virtio_dev, &vv->mmap_region,
@@ -1215,6 +1217,7 @@ static unsigned int features[] = {
 	VIRTIO_MEDIA_F_EXPORT_IMPORT,
 	VIRTIO_MEDIA_F_SHARE_FENCE,
 	VIRTIO_MEDIA_F_PEER_GREF_IMPORT,
+	VIRTIO_MEDIA_F_IMPORT_BUFFER,
 };
 
 static struct virtio_driver virtio_media_driver = {

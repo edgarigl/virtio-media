@@ -1,3 +1,4 @@
+#include <linux/uuid.h>
 /* SPDX-License-Identifier: BSD-3-Clause OR GPL-2.0+ */
 
 /*
@@ -33,6 +34,13 @@ struct virtio_media_buffer {
 	struct v4l2_buffer buffer;
 	struct v4l2_plane planes[VIDEO_MAX_PLANES];
 	struct list_head list;
+	/*
+	 * import-uuid mode: cache the host-fd registration so QBUF only sends
+	 * REGISTER_BUFFER when this buffer index is new or its backing dma-buf
+	 * (UUID) changed.  Reset whenever the buffers array is reallocated.
+	 */
+	bool imported;
+	uuid_t imported_uuid;
 };
 
 /**
