@@ -44,6 +44,9 @@
  */
 #define VIRTIO_MEDIA_F_PEER_GREF_IMPORT 60
 
+/* Device resolves a guest virtio-gpu blob (by UUID) to a host dmabuf. */
+#define VIRTIO_MEDIA_F_IMPORT_BUFFER 59
+
 /**
  * struct virtio_media_cmd_header - Header for all virtio-media commands.
  * @cmd: one of VIRTIO_MEDIA_CMD_*.
@@ -299,6 +302,16 @@ struct virtio_media_cmd_import_buffer {
 	u64 handle_id;
 };
 
+struct virtio_media_cmd_register_buffer {
+	struct virtio_media_cmd_header hdr;
+	u32 session_id;
+	u32 buffer_index;
+	u8 uuid[16];
+};
+struct virtio_media_resp_register_buffer {
+	struct virtio_media_resp_header hdr;
+};
+
 struct virtio_media_resp_import_buffer {
 	struct virtio_media_resp_header hdr;
 	u64 driver_addr;
@@ -314,6 +327,7 @@ struct virtio_media_resp_import_buffer {
  * VIRTIO_MEDIA_CMD_RELEASE_HANDLE - Release a previously exported handle.
  */
 #define VIRTIO_MEDIA_CMD_RELEASE_HANDLE 8
+#define VIRTIO_MEDIA_CMD_REGISTER_BUFFER 9
 
 struct virtio_media_cmd_release_handle {
 	struct virtio_media_cmd_header hdr;

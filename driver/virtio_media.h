@@ -56,6 +56,7 @@ struct virtio_media {
 	bool use_export_import;
 	bool use_share_fence;
 	bool use_peer_gref_import;
+	bool use_import;
 
 	void *event_buffer;
 
