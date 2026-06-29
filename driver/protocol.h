@@ -30,14 +30,6 @@
 #define VIRTIO_MEDIA_F_EXPORT_IMPORT 62
 
 /*
- * VIRTIO_MEDIA_F_SHARE_FENCE - Device supports explicit fence metadata for
- * shared buffers.
- *
- * This bit is currently negotiated only for forward compatibility.
- */
-#define VIRTIO_MEDIA_F_SHARE_FENCE 61
-
-/*
  * VIRTIO_MEDIA_F_PEER_GREF_IMPORT - Device can broker grant refs for a
  * specific peer Xen domid when importing a shared handle.
  */
