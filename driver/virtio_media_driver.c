@@ -981,7 +981,14 @@ static int virtio_media_device_mmap(struct file *file,
 		sg_set_buf(&resp_sg, resp_mmap, resp_len);
 		sg_mark_end(&resp_sg);
 
-		ret = virtio_media_send_command(vv, sgs, 1, 1, resp_len, NULL);
+		/*
+		 * Without grant references the device returns only the spec base
+		 * fields (hdr, driver_addr, len); requiring sizeof(*resp_mmap)
+		 * here would reject a valid response as too short.
+		 */
+		ret = virtio_media_send_command(vv, sgs, 1, 1,
+						VIRTIO_MEDIA_RESP_MMAP_BASE_SIZE,
+						NULL);
 		if (ret < 0)
 			goto end;
 

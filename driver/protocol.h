@@ -231,6 +231,15 @@ struct virtio_media_resp_mmap {
 	u32 gref_ids[0];
 };
 
+/*
+ * Size of the spec base VIRTIO_MEDIA_CMD_MMAP response (hdr, driver_addr, len).
+ * The grant-reference fields above are only populated when
+ * VIRTIO_MEDIA_F_GNTREF is negotiated; a non-gref response is exactly this
+ * many bytes, never sizeof(struct virtio_media_resp_mmap).
+ */
+#define VIRTIO_MEDIA_RESP_MMAP_BASE_SIZE \
+	offsetof(struct virtio_media_resp_mmap, gref_count)
+
 /**
  * VIRTIO_MEDIA_CMD_MUNMAP - Unmap a MMAP buffer previously mapped using
  * VIRTIO_MEDIA_CMD_MMAP.
