@@ -28,6 +28,11 @@
  * capture buffers through explicit commands.
  */
 #define VIRTIO_MEDIA_F_EXPORT_IMPORT 62
+/* Private, opt-in host dma-buf to guest virtio-gpu export extension. */
+#define VIRTIO_MEDIA_F_EXPORT_GPU 58
+#define VIRTIO_MEDIA_CMD_EXPORT_GPU 10
+
+/* Uses virtio_media_cmd_export_buffer as the request. */
 
 /*
  * VIRTIO_MEDIA_F_PEER_GREF_IMPORT - Device can broker grant refs for a
@@ -287,6 +292,12 @@ struct virtio_media_resp_export_buffer {
 	u64 len;
 	u32 plane_count;
 	u32 __reserved;
+};
+
+struct virtio_media_resp_export_gpu {
+	struct virtio_media_resp_header hdr;
+	u64 blob_id;
+	u64 len;
 };
 
 /*

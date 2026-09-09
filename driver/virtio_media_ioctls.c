@@ -7,6 +7,7 @@
  */
 
 #include <linux/mutex.h>
+#include <linux/module.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/scatterlist.h>
@@ -14,6 +15,7 @@
 #include <linux/version.h>
 #include <linux/videodev2.h>
 #include <linux/virtio_config.h>
+#include <linux/virtio_ids.h>
 #include <linux/virtio_dma_buf.h>
 #include <linux/uuid.h>
 #include <linux/vmalloc.h>
@@ -25,6 +27,93 @@
 #include "virtio_media.h"
 
 #define VIRTIO_MEDIA_DMABUF_MAGIC 0x564D4442
+
+/* Optional helper built into virtio-gpu; see guest-kernel/virtgpu_media.c. */
+extern struct dma_buf *virtio_gpu_export_host_blob(struct virtio_device *vdev,
+						  u64 blob_id, u64 size,
+						  int flags);
+
+static int virtio_media_match_gpu(struct device *dev, const void *unused)
+{
+	struct virtio_device *vdev = dev_to_virtio(dev);
+
+	return vdev->id.device == VIRTIO_ID_GPU && dev->driver;
+}
+
+static int virtio_media_export_gpu(struct v4l2_fh *fh,
+				   struct v4l2_exportbuffer *exp)
+{
+	struct virtio_media *vv = to_virtio_media(fh->vdev);
+	struct virtio_media_session *session = fh_to_session(fh);
+	struct virtio_media_cmd_export_buffer *cmd;
+	struct virtio_media_resp_export_gpu *resp;
+	struct scatterlist cmd_sg, resp_sg;
+	struct scatterlist *sgs[] = { &cmd_sg, &resp_sg };
+	struct device *gpu, *second;
+	struct dma_buf *dbuf;
+	typeof(virtio_gpu_export_host_blob) *export_blob;
+	int ret;
+
+	if (exp->flags & ~(O_CLOEXEC | O_ACCMODE))
+		return -EINVAL;
+	if ((exp->flags & O_ACCMODE) == O_ACCMODE)
+		return -EINVAL;
+	export_blob = symbol_get(virtio_gpu_export_host_blob);
+	if (!export_blob)
+		return -EOPNOTSUPP;
+	/* One GPU per domU for this prototype; reject ambiguous device pairing. */
+	gpu = bus_find_device(vv->virtio_dev->dev.bus, NULL, NULL,
+			      virtio_media_match_gpu);
+	if (!gpu) {
+		ret = -ENODEV;
+		goto out_symbol;
+	}
+	second = bus_find_device(vv->virtio_dev->dev.bus, gpu, NULL,
+				 virtio_media_match_gpu);
+	if (second) {
+		put_device(second);
+		ret = -EOPNOTSUPP;
+		goto out_device;
+	}
+	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	resp = kzalloc(sizeof(*resp), GFP_KERNEL);
+	if (!cmd || !resp) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
+	cmd->hdr.cmd = cpu_to_le32(VIRTIO_MEDIA_CMD_EXPORT_GPU);
+	cmd->session_id = cpu_to_le32(session->id);
+	cmd->queue_type = cpu_to_le32(exp->type);
+	cmd->buffer_index = cpu_to_le32(exp->index);
+	cmd->plane_index = cpu_to_le32(exp->plane);
+	cmd->flags = cpu_to_le32(exp->flags);
+	sg_init_one(&cmd_sg, cmd, sizeof(*cmd));
+	sg_init_one(&resp_sg, resp, sizeof(*resp));
+	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp), NULL);
+	if (ret)
+		goto out_free;
+	dbuf = export_blob(dev_to_virtio(gpu), le64_to_cpu(resp->blob_id),
+			   le64_to_cpu(resp->len), exp->flags & O_ACCMODE);
+	if (IS_ERR(dbuf)) {
+		ret = PTR_ERR(dbuf);
+		goto out_free;
+	}
+	ret = dma_buf_fd(dbuf, exp->flags & O_CLOEXEC);
+	if (ret < 0)
+		dma_buf_put(dbuf);
+	else {
+		exp->fd = ret;
+		ret = 0;
+	}
+out_free:
+	kfree(resp);
+	kfree(cmd);
+out_device:
+	put_device(gpu);
+out_symbol:
+	symbol_put(virtio_gpu_export_host_blob);
+	return ret;
+}
 
 struct virtio_media_dmabuf {
 	u32 magic;
@@ -1382,6 +1471,8 @@ static int virtio_media_expbuf(struct file *file, void *fh,
 	int fd_flags = (exp->flags & O_CLOEXEC) ? O_CLOEXEC : 0;
 	int ret;
 
+	if (vv->use_gpu_export)
+		return virtio_media_export_gpu(fh, exp);
 	if (!vv->use_export_import)
 		return -EOPNOTSUPP;
 	if (exp->type > VIRTIO_MEDIA_LAST_QUEUE)
