@@ -34,7 +34,7 @@ If virtio-media is already loaded, unload its old module before the last step.
 These commands do not replace the installed modules; a reboot restores those.
 
 The QEMU companion is on
-[virtio-media-handover](https://github.com/edgarigl/qemu/tree/virtio-media-handover).
+[edgari/virtio-media](https://github.com/edgarigl/qemu/tree/edgari/virtio-media).
 Configure both devices:
 
 ```text
@@ -63,3 +63,32 @@ gfxstream import, explicit pairing of multiple GPUs, and CPU mmap of the
 video node in export-gpu mode remain outside this experiment. An EXPBUF fd
 uses the GPU's mapping implementation. GPU/display completion must precede
 requeue when continuous capture is added.
+
+
+## Common host allocation identity
+
+Load the rebuilt helper with `media_assign_uuid=1` to request
+USE_CROSS_DEVICE and RESOURCE_ASSIGN_UUID for media-backed blobs. The default
+is off. QEMU must enable `x-blob-common-uuid=on` alongside
+`x-blob-import-media=on` to provide the host-derived shared identity; enabling
+the guest parameter alone only requests the normal host UUID API and does
+not prove that the host uses common identities. Missing UUID feature support
+is rejected by the helper.
+
+The kernel's `virtio_dma_buf_get_uuid()` exposes the assigned UUID. The
+optional test-only `tests/uuid-probe.c` misc module (root-only device node)
+and `tests/uuid-check.c` exercise that API, compare two aliases per slot and
+verify identity after media queue teardown and closing one alias:
+
+```sh
+make -C /lib/modules/$(uname -r)/build M="$PWD/guest-kernel/tests" modules
+cc -Wall -Wextra -Werror guest-kernel/tests/uuid-check.c -o /tmp/uuid-check
+sudo insmod guest-kernel/tests/uuid-probe.ko
+sudo /tmp/uuid-check /dev/video0
+sudo /tmp/uuid-check /dev/video0 reverse
+```
+
+Use matching guest kernel headers. The probe is a validation adapter, not a
+production ioctl. Remove it after testing. Shared UUIDs identify allocations,
+not frames or access rights; neither this helper nor the UUID probe enforces
+read-only source access.

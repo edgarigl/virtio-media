@@ -6,6 +6,10 @@
 #include <drm/drm_prime.h>
 #include "virtgpu_drv.h"
 
+static bool media_assign_uuid;
+module_param(media_assign_uuid, bool, 0444);
+MODULE_PARM_DESC(media_assign_uuid, "Request UUIDs for media-backed GPU exports");
+
 struct dma_buf *virtio_gpu_export_host_blob(struct virtio_device *vdev,
 					   u64 blob_id, u64 size, int flags);
 
@@ -40,6 +44,13 @@ struct dma_buf *virtio_gpu_export_host_blob(struct virtio_device *vdev,
 		dbuf = ERR_PTR(-EOPNOTSUPP);
 		goto out_exit;
 	}
+	if (media_assign_uuid) {
+		if (!vgdev->has_resource_assign_uuid) {
+			dbuf = ERR_PTR(-EOPNOTSUPP);
+			goto out_exit;
+		}
+		params.blob_flags |= VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE;
+	}
 	/* QEMU imports the fd without a renderer context; consumers attach later. */
 	ret = virtio_gpu_vram_create(vgdev, &params, &bo);
 	if (ret) {
@@ -49,6 +60,14 @@ struct dma_buf *virtio_gpu_export_host_blob(struct virtio_device *vdev,
 	bo->host3d_blob = true;
 	bo->blob_mem = params.blob_mem;
 	bo->blob_flags = params.blob_flags;
+	if (media_assign_uuid) {
+		ret = virtio_gpu_resource_assign_uuid(vgdev, bo);
+		if (ret) {
+			drm_gem_object_put(&bo->base.base);
+			dbuf = ERR_PTR(ret);
+			goto out_exit;
+		}
+	}
 	dbuf = virtgpu_gem_prime_export(&bo->base.base, flags);
 	drm_gem_object_put(&bo->base.base);
 	virtio_gpu_notify(vgdev);
