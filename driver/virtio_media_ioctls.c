@@ -25,6 +25,7 @@
 
 #include "scatterlist_builder.h"
 #include "virtio_media.h"
+#include "../include/uapi/linux/virtio_media_gpu.h"
 
 #define VIRTIO_MEDIA_DMABUF_MAGIC 0x564D4442
 
@@ -40,15 +41,66 @@ static int virtio_media_match_gpu(struct device *dev, const void *unused)
 	return vdev->id.device == VIRTIO_ID_GPU && dev->driver;
 }
 
-static int virtio_media_export_gpu(struct v4l2_fh *fh,
-				   struct v4l2_exportbuffer *exp)
+static int virtio_media_get_gpu_export(struct v4l2_fh *fh,
+				      struct virtio_media_gpu_export *export)
 {
 	struct virtio_media *vv = to_virtio_media(fh->vdev);
-	struct virtio_media_session *session = fh_to_session(fh);
 	struct virtio_media_cmd_export_buffer *cmd;
 	struct virtio_media_resp_export_gpu *resp;
 	struct scatterlist cmd_sg, resp_sg;
 	struct scatterlist *sgs[] = { &cmd_sg, &resp_sg };
+	int ret;
+
+	if (!vv->use_gpu_export)
+		return -EOPNOTSUPP;
+	if (export->version != VIRTIO_MEDIA_GPU_EXPORT_VERSION ||
+	    export->flags || memchr_inv(export->reserved, 0,
+					sizeof(export->reserved)) ||
+	    (export->type != V4L2_BUF_TYPE_VIDEO_CAPTURE &&
+	     export->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE))
+		return -EINVAL;
+
+	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	resp = kzalloc(sizeof(*resp), GFP_KERNEL);
+	if (!cmd || !resp) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	cmd->hdr.cmd = cpu_to_le32(VIRTIO_MEDIA_CMD_EXPORT_GPU);
+	cmd->session_id = cpu_to_le32(fh_to_session(fh)->id);
+	cmd->queue_type = cpu_to_le32(export->type);
+	cmd->buffer_index = cpu_to_le32(export->index);
+	cmd->plane_index = cpu_to_le32(export->plane);
+	sg_init_one(&cmd_sg, cmd, sizeof(*cmd));
+	sg_init_one(&resp_sg, resp, sizeof(*resp));
+	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp), NULL);
+	if (ret)
+		goto out;
+	if (le64_to_cpu(resp->blob_id) < 0xfffe000000000000ULL ||
+	    le64_to_cpu(resp->blob_id) == U64_MAX ||
+	    !le64_to_cpu(resp->len) ||
+	    !IS_ALIGNED(le64_to_cpu(resp->len), PAGE_SIZE)) {
+		ret = -EPROTO;
+		goto out;
+	}
+	export->blob_id = le64_to_cpu(resp->blob_id);
+	export->size = le64_to_cpu(resp->len);
+out:
+	kfree(cmd);
+	kfree(resp);
+	return ret;
+}
+
+static int virtio_media_export_gpu(struct v4l2_fh *fh,
+				   struct v4l2_exportbuffer *exp)
+{
+	struct virtio_media *vv = to_virtio_media(fh->vdev);
+	struct virtio_media_gpu_export export = {
+		.version = VIRTIO_MEDIA_GPU_EXPORT_VERSION,
+		.type = exp->type,
+		.index = exp->index,
+		.plane = exp->plane,
+	};
 	struct device *gpu, *second;
 	struct dma_buf *dbuf;
 	typeof(virtio_gpu_export_host_blob) *export_blob;
@@ -75,28 +127,14 @@ static int virtio_media_export_gpu(struct v4l2_fh *fh,
 		ret = -EOPNOTSUPP;
 		goto out_device;
 	}
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
-	resp = kzalloc(sizeof(*resp), GFP_KERNEL);
-	if (!cmd || !resp) {
-		ret = -ENOMEM;
-		goto out_free;
-	}
-	cmd->hdr.cmd = cpu_to_le32(VIRTIO_MEDIA_CMD_EXPORT_GPU);
-	cmd->session_id = cpu_to_le32(session->id);
-	cmd->queue_type = cpu_to_le32(exp->type);
-	cmd->buffer_index = cpu_to_le32(exp->index);
-	cmd->plane_index = cpu_to_le32(exp->plane);
-	cmd->flags = cpu_to_le32(exp->flags);
-	sg_init_one(&cmd_sg, cmd, sizeof(*cmd));
-	sg_init_one(&resp_sg, resp, sizeof(*resp));
-	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp), NULL);
+	ret = virtio_media_get_gpu_export(fh, &export);
 	if (ret)
-		goto out_free;
-	dbuf = export_blob(dev_to_virtio(gpu), le64_to_cpu(resp->blob_id),
-			   le64_to_cpu(resp->len), exp->flags & O_ACCMODE);
+		goto out_device;
+	dbuf = export_blob(dev_to_virtio(gpu), export.blob_id, export.size,
+			   exp->flags & O_ACCMODE);
 	if (IS_ERR(dbuf)) {
 		ret = PTR_ERR(dbuf);
-		goto out_free;
+		goto out_device;
 	}
 	ret = dma_buf_fd(dbuf, exp->flags & O_CLOEXEC);
 	if (ret < 0)
@@ -105,9 +143,6 @@ static int virtio_media_export_gpu(struct v4l2_fh *fh,
 		exp->fd = ret;
 		ret = 0;
 	}
-out_free:
-	kfree(resp);
-	kfree(cmd);
 out_device:
 	put_device(gpu);
 out_symbol:
@@ -2164,6 +2199,24 @@ long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
 	 * them from here.
 	 */
 	switch (cmd) {
+	case VIDIOC_VIRTIO_MEDIA_EXPORT_GPU: {
+		struct virtio_media_gpu_export gpu_export;
+
+		if (!vfh) {
+			ret = -EINVAL;
+			break;
+		}
+		if (copy_from_user(&gpu_export, (void __user *)arg,
+				   sizeof(gpu_export))) {
+			ret = -EFAULT;
+			break;
+		}
+		ret = virtio_media_get_gpu_export(vfh, &gpu_export);
+		if (!ret && copy_to_user((void __user *)arg, &gpu_export,
+					sizeof(gpu_export)))
+			ret = -EFAULT;
+		break;
+	}
 	case VIDIOC_S_STD:
 		ret = copy_from_user(&std_id, (void __user *)arg,
 				     sizeof(std_id));
