@@ -1,0 +1,9 @@
+prefix=@PREFIX@
+libdir=@LIBDIR@
+includedir=@INCLUDEDIR@
+
+Name: virtio-media-gpu
+Description: Guest media DMA-BUF export through stock virtio-gpu
+Version: 0.1.0
+Libs: -L${libdir} -lvirtio-media-gpu
+Cflags: -I${includedir}

@@ -1,5 +1,10 @@
 # Guest GPU export experiment
 
+For applications that can use an explicit buffer-setup API, prefer the
+[userspace adapter](../userspace/README.md). It uses the stock guest GPU driver
+with the media export-info ioctl. The kernel helper below remains the
+compatibility path for ordinary, unadapted VIDIOC_EXPBUF calls.
+
 The optional helper in `virtgpu_media.c` lets virtio-media `VIDIOC_EXPBUF`
 return a real virtio-gpu dma-buf backed by an external host allocation. The
 application uses ordinary V4L2 EXPBUF and Vulkan dma-buf import; it does not
