@@ -1243,4 +1243,8 @@ MODULE_DEVICE_TABLE(virtio, id_table);
 MODULE_DESCRIPTION("virtio media driver");
 MODULE_AUTHOR("Alexandre Courbot <gnurou@gmail.com>");
 MODULE_LICENSE("Dual BSD/GPL");
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0)
+MODULE_IMPORT_NS(DMA_BUF);
+#else
 MODULE_IMPORT_NS("DMA_BUF");
+#endif
