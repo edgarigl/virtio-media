@@ -11,6 +11,7 @@
 #include <linux/dev_printk.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/refcount.h>
 #include <linux/scatterlist.h>
 #include <linux/types.h>
 #include <linux/videodev2.h>
@@ -726,6 +727,7 @@ struct virtio_media_gref_mapping {
 };
 
 struct virtio_media_vma {
+	refcount_t refs;
 	struct virtio_media *vv;
 	struct virtio_media_session *session;
 	struct virtio_media_gref_mapping *gref;
@@ -742,6 +744,9 @@ static void virtio_media_vma_close_locked(struct vm_area_struct *vma)
 	struct scatterlist *sgs[2] = { &cmd_sg, &resp_sg };
 	struct virtio_media_gref_mapping *gref = vma_data->gref;
 	int ret;
+
+	if (!refcount_dec_and_test(&vma_data->refs))
+		return;
 
 	sg_set_buf(&cmd_sg, cmd_munmap, sizeof(*cmd_munmap));
 	sg_mark_end(&cmd_sg);
@@ -809,7 +814,16 @@ static void virtio_media_vma_close(struct vm_area_struct *vma)
 	mutex_unlock(&vv->vlock);
 }
 
+/* Fork and VMA splitting share vm_private_data with the original mapping. */
+static void virtio_media_vma_open(struct vm_area_struct *vma)
+{
+	struct virtio_media_vma *vma_data = vma->vm_private_data;
+
+	refcount_inc(&vma_data->refs);
+}
+
 static const struct vm_operations_struct virtio_media_vm_ops = {
+	.open = virtio_media_vma_open,
 	.close = virtio_media_vma_close,
 };
 
@@ -852,6 +866,7 @@ static int virtio_media_device_mmap(struct file *file,
 		ret = -ENOMEM;
 		goto end;
 	}
+	refcount_set(&vma_data->refs, 1);
 	vma_data->vv = vv;
 	vma_data->session = session;
 
@@ -1009,6 +1024,8 @@ static int virtio_media_device_mmap(struct file *file,
 			dev_dbg(&video_dev->dev,
 				"invalid MMAP, as it would overflow buffer length\n");
 			virtio_media_vma_close_locked(vma);
+			vma->vm_private_data = NULL;
+			vma_data = NULL;
 			ret = -EINVAL;
 			goto end;
 		}
@@ -1016,8 +1033,12 @@ static int virtio_media_device_mmap(struct file *file,
 		ret = io_remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
 					 vma->vm_end - vma->vm_start,
 					 vma->vm_page_prot);
-		if (ret)
+		if (ret) {
+			virtio_media_vma_close_locked(vma);
+			vma->vm_private_data = NULL;
+			vma_data = NULL;
 			goto end;
+		}
 
 		vma->vm_ops = &virtio_media_vm_ops;
 	}
