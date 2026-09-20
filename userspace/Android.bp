@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: BSD-3-Clause
+cc_library_static {
+    name: "libvirtio_media_gpu",
+    vendor: true,
+    srcs: ["virtio-media-gpu.c"],
+    local_include_dirs: ["../include/uapi"],
+    export_include_dirs: ["include"],
+    header_libs: ["libdrm_headers"],
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+}

@@ -128,3 +128,20 @@ exercise this API directly; they use no LD_PRELOAD interposition.
 The initial qualified target is x86-64 Ubuntu 6.14 Linux/Venus with the existing
 QEMU and Xen HMEM stack. The fixed-width ioctl layout does not by itself
 qualify 32-bit compatibility, Android/gfxstream, or multiple GPU devices.
+
+### Android EVS integration and VMA regression
+
+`Android.bp` provides the vendor static module `libvirtio_media_gpu` for an
+internal provider dependency. Place this repository in the product's source
+manifest before enabling a provider target that links it. It uses the product
+libdrm headers; full Soong product validation remains required.
+
+`tests/mmap-lifetime.c` exercises a media MMAP surviving child exit, a split
+mapping, and an oversized map rejection, without starting capture. Compile
+with the Android NDK and run only after installing the VMA reference-counting
+fix. On the old driver, child exit can free the parent's VMA private data and
+panic the guest during later teardown. The 21 September guest panic happened
+after a provider fd-ownership abort; the missing VMA open reference is a source
+finding consistent with that trace, not a completed runtime root-cause test.
+The probe has been cross-compiled but not run. The live crashed AAOS17 guest
+was preserved and no module was replaced.
