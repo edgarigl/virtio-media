@@ -29,7 +29,8 @@
  */
 #define VIRTIO_MEDIA_F_EXPORT_IMPORT 62
 /* Private, opt-in host dma-buf to guest virtio-gpu export extension. */
-#define VIRTIO_MEDIA_F_EXPORT_GPU 58
+/* VAS3 reserves bit 58 for Xenia's UUID-on-dequeue protocol. */
+#define VIRTIO_MEDIA_F_EXPORT_GPU 54
 #define VIRTIO_MEDIA_CMD_EXPORT_GPU 10
 
 /* Uses virtio_media_cmd_export_buffer as the request. */
