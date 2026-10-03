@@ -247,9 +247,11 @@ static void commandq_callback(struct virtqueue *queue)
 
 process_bufs:
 	while ((param = virtqueue_get_buf(queue, &len))) {
-		param->done = true;
+		struct virtio_media *vv = param->vv;
+
 		param->resp_len = len;
-		wake_up(&param->vv->wq);
+		smp_store_release(&param->done, true);
+		wake_up(&vv->wq);
 	}
 
 	if (!virtqueue_enable_cb(queue)) {
@@ -289,17 +291,16 @@ static int virtio_media_kick_command(struct virtio_media *vv,
 		return ret;
 	}
 
-	if (!virtqueue_kick(vv->commandq)) {
-		v4l2_err(&vv->v4l2_dev, "failed to kick command virtqueue\n");
-		return -EINVAL;
-	}
+	virtqueue_kick(vv->commandq);
 
 	/* Wait for the response. */
-	ret = wait_event_timeout(vv->wq, cb_param.done, 5 * HZ);
+	ret = wait_event_timeout(vv->wq, smp_load_acquire(&cb_param.done),
+				 5 * HZ);
 	if (ret == 0) {
 		v4l2_err(&vv->v4l2_dev,
-			 "timed out waiting for response to command\n");
-		return -ETIMEDOUT;
+			 "command timeout: retaining storage until completion\n");
+		/* The peer may still use the submitted descriptors and buffers. */
+		wait_event(vv->wq, smp_load_acquire(&cb_param.done));
 	}
 
 	if (resp_len)
