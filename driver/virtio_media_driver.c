@@ -934,6 +934,8 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 	if (ret)
 		goto err_register_device;
 
+	virtio_device_ready(virtio_dev);
+
 	for (i = 0; i < VIRTIO_MEDIA_NUM_EVENT_BUFS; i++) {
 		void *ebuf = vv->event_buffer + VIRTIO_MEDIA_EVENT_MAX_SIZE * i;
 
@@ -942,11 +944,10 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 			goto err_send_event_buffer;
 	}
 
-	virtio_device_ready(virtio_dev);
-
 	return 0;
 
 err_send_event_buffer:
+	virtio_reset_device(virtio_dev);
 	video_unregister_device(&vv->video_dev);
 err_register_device:
 	virtio_dev->config->del_vqs(virtio_dev);
