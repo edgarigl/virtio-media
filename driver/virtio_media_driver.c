@@ -706,9 +706,8 @@ static __poll_t virtio_media_device_poll(struct file *file, poll_table *wait)
 	return rc;
 }
 
-static void virtio_media_vma_close_locked(struct vm_area_struct *vma)
+static void virtio_media_munmap_locked(struct virtio_media *vv, u64 driver_addr)
 {
-	struct virtio_media *vv = vma->vm_private_data;
 	struct virtio_media_cmd_munmap *cmd_munmap = &vv->cmd.munmap;
 	struct virtio_media_resp_munmap *resp_munmap = &vv->resp.munmap;
 	struct scatterlist cmd_sg = {}, resp_sg = {};
@@ -722,14 +721,21 @@ static void virtio_media_vma_close_locked(struct vm_area_struct *vma)
 	sg_mark_end(&resp_sg);
 
 	cmd_munmap->hdr.cmd = VIRTIO_MEDIA_CMD_MUNMAP;
-	cmd_munmap->driver_addr =
-		(vma->vm_pgoff << PAGE_SHIFT) - vv->mmap_region.addr;
+	cmd_munmap->driver_addr = driver_addr;
 	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp_munmap),
 					NULL);
 	if (ret < 0) {
 		v4l2_err(&vv->v4l2_dev, "host failed to unmap buffer: %d\n",
 			 ret);
 	}
+}
+
+static void virtio_media_vma_close_locked(struct vm_area_struct *vma)
+{
+	struct virtio_media *vv = vma->vm_private_data;
+
+	virtio_media_munmap_locked(vv,
+		(vma->vm_pgoff << PAGE_SHIFT) - vv->mmap_region.addr);
 }
 
 /**
@@ -777,6 +783,8 @@ static int virtio_media_device_mmap(struct file *file,
 		return -EINVAL;
 	if (!(vma->vm_flags & (VM_READ | VM_WRITE)))
 		return -EINVAL;
+	if (!vv->mmap_region.len)
+		return -EOPNOTSUPP;
 
 	mutex_lock(&vv->vlock);
 
@@ -803,6 +811,18 @@ static int virtio_media_device_mmap(struct file *file,
 	if (ret < 0)
 		goto end;
 
+	/* Validate the returned range before turning it into physical PFNs. */
+	if (!resp_mmap->len || !IS_ALIGNED(resp_mmap->driver_addr, PAGE_SIZE) ||
+	    resp_mmap->driver_addr > vv->mmap_region.len ||
+	    resp_mmap->len > vv->mmap_region.len - resp_mmap->driver_addr ||
+	    resp_mmap->len > U64_MAX - (PAGE_SIZE - 1) ||
+	    PAGE_ALIGN(resp_mmap->len) >
+		vv->mmap_region.len - resp_mmap->driver_addr ||
+	    vv->mmap_region.addr > U64_MAX - resp_mmap->driver_addr) {
+		virtio_media_munmap_locked(vv, resp_mmap->driver_addr);
+		ret = -EINVAL;
+		goto end;
+	}
 	vma->vm_private_data = vv;
 	/*
 	 * Keep the guest address at which the buffer is mapped since we will
@@ -825,8 +845,10 @@ static int virtio_media_device_mmap(struct file *file,
 	ret = io_remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
 				 vma->vm_end - vma->vm_start,
 				 vma->vm_page_prot);
-	if (ret)
+	if (ret) {
+		virtio_media_vma_close_locked(vma);
 		goto end;
+	}
 
 	vma->vm_ops = &virtio_media_vm_ops;
 
