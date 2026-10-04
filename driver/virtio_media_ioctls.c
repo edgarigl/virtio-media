@@ -982,8 +982,12 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
 	 */
 	mutex_unlock(&vv->vlock);
 	ret = wait_event_interruptible(session->dqbuf_wait,
-				       !list_empty(buffer_queue));
+				       !list_empty(buffer_queue) ||
+				       READ_ONCE(vv->disconnected) ||
+				       READ_ONCE(session->error));
 	mutex_lock(&vv->vlock);
+	if (vv->disconnected || session->error)
+		return -ENODEV;
 	if (ret)
 		return -EINTR;
 
@@ -1305,6 +1309,17 @@ long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
 		vfh = file_to_v4l2_fh(file);
 
 	mutex_lock(&vv->vlock);
+	if (vv->disconnected || (vfh && READ_ONCE(fh_to_session(vfh)->error))) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+	/* Keep mapped slots owned until their last reference releases. */
+	if (vv->mappings &&
+	    (cmd == VIDIOC_REQBUFS || cmd == VIDIOC_CREATE_BUFS ||
+	     cmd == VIDIOC_S_FMT || cmd == VIDIOC_S_INPUT || cmd == VIDIOC_S_STD)) {
+		ret = -EBUSY;
+		goto unlock;
+	}
 
 	/*
 	 * We need to handle a few ioctls manually because their result
@@ -1350,6 +1365,7 @@ long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
 		break;
 	}
 
+unlock:
 	mutex_unlock(&vv->vlock);
 
 	return ret;

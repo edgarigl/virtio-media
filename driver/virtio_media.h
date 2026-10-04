@@ -51,10 +51,14 @@ struct virtio_media {
 	struct work_struct eventq_work;
 
 	struct virtio_shm_region mmap_region;
+	bool disconnected;
+	bool queues_stopped;
+	struct mutex command_lock; /* submission versus queue teardown */
 
 	void *event_buffer;
 
 	struct list_head sessions;
+	unsigned int mappings; /* live original MMAP requests, under vlock */
 	struct mutex sessions_lock; /* protects sessions list */
 
 	struct mutex events_lock; /* prevents concurrent event processing */

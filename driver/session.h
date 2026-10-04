@@ -86,6 +86,7 @@ struct virtio_media_session {
 	u32 id;
 	bool nonblocking_dequeue;
 	bool uses_mplane;
+	bool error;
 
 	union {
 		struct virtio_media_cmd_close close;

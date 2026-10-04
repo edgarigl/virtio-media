@@ -12,6 +12,7 @@
 #include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/refcount.h>
 #include <linux/scatterlist.h>
 #include <linux/types.h>
 #include <linux/videodev2.h>
@@ -74,6 +75,32 @@ module_param_named(allow_userptr, virtio_media_allow_userptr, bool, 0660);
 bool virtio_media_override_timestamp;
 module_param_named(override_timestamp, virtio_media_override_timestamp, bool,
 		   0660);
+
+static void virtio_media_stop_queues(struct virtio_media *vv)
+{
+	struct virtio_media_session *session;
+
+	WRITE_ONCE(vv->disconnected, true);
+	/* Do not wait for vlock: a command waiting for its reply holds it. */
+	mutex_lock(&vv->events_lock);
+	mutex_lock(&vv->command_lock);
+	if (!vv->queues_stopped) {
+		virtio_reset_device(vv->virtio_dev);
+		vv->virtio_dev->config->del_vqs(vv->virtio_dev);
+		/* del_vqs must stop the peer before submitted storage is released. */
+		smp_store_release(&vv->queues_stopped, true);
+		wake_up_all(&vv->wq);
+	}
+	mutex_unlock(&vv->command_lock);
+	mutex_unlock(&vv->events_lock);
+	cancel_work_sync(&vv->eventq_work);
+	mutex_lock(&vv->sessions_lock);
+	list_for_each_entry(session, &vv->sessions, list) {
+		wake_up_all(&session->dqbuf_wait);
+		wake_up_all(&session->fh.wait);
+	}
+	mutex_unlock(&vv->sessions_lock);
+}
 
 /**
  * virtio_media_session_alloc - Allocate a new session.
@@ -179,6 +206,13 @@ static int virtio_media_session_close(struct virtio_media *vv,
 
 	mutex_lock(&vv->vlock);
 
+	if (vv->disconnected) {
+		mutex_lock(&vv->events_lock);
+		virtio_media_session_free(vv, session);
+		mutex_unlock(&vv->events_lock);
+		mutex_unlock(&vv->vlock);
+		return 0;
+	}
 	cmd_close->hdr.cmd = VIRTIO_MEDIA_CMD_CLOSE;
 	cmd_close->session_id = session->id;
 
@@ -186,13 +220,12 @@ static int virtio_media_session_close(struct virtio_media *vv,
 	sg_mark_end(&cmd_sg);
 
 	ret = virtio_media_send_command(vv, sgs, 1, 0, 0, NULL);
-	mutex_unlock(&vv->vlock);
-	if (ret < 0)
-		return ret;
-
+	mutex_lock(&vv->events_lock);
 	virtio_media_session_free(vv, session);
+	mutex_unlock(&vv->events_lock);
+	mutex_unlock(&vv->vlock);
 
-	return 0;
+	return ret;
 }
 
 /**
@@ -283,25 +316,34 @@ static int virtio_media_kick_command(struct virtio_media *vv,
 	struct virtio_media_resp_header *resp_header;
 	int ret;
 
+	mutex_lock(&vv->command_lock);
+	if (READ_ONCE(vv->disconnected)) {
+		mutex_unlock(&vv->command_lock);
+		return -ENODEV;
+	}
 	ret = virtqueue_add_sgs(vv->commandq, sgs, out_sgs, in_sgs, &cb_param,
 				GFP_ATOMIC);
 	if (ret) {
+		mutex_unlock(&vv->command_lock);
 		v4l2_err(&vv->v4l2_dev,
 			 "failed to add sgs to command virtqueue\n");
 		return ret;
 	}
 
 	virtqueue_kick(vv->commandq);
+	mutex_unlock(&vv->command_lock);
 
 	/* Wait for the response. */
-	ret = wait_event_timeout(vv->wq, smp_load_acquire(&cb_param.done),
+	ret = wait_event_timeout(vv->wq, smp_load_acquire(&cb_param.done) ||
+				 smp_load_acquire(&vv->queues_stopped),
 				 5 * HZ);
 	if (ret == 0) {
-		v4l2_err(&vv->v4l2_dev,
-			 "command timeout: retaining storage until completion\n");
-		/* The peer may still use the submitted descriptors and buffers. */
-		wait_event(vv->wq, smp_load_acquire(&cb_param.done));
+		v4l2_err(&vv->v4l2_dev, "command timeout: stopping queues\n");
+		virtio_media_stop_queues(vv);
+		return -ETIMEDOUT;
 	}
+	if (smp_load_acquire(&vv->queues_stopped))
+		return -ENODEV;
 
 	if (resp_len)
 		*resp_len = cb_param.resp_len;
@@ -344,8 +386,12 @@ int virtio_media_send_command(struct virtio_media *vv, struct scatterlist **sgs,
 			      size_t minimum_resp_len, size_t *resp_len)
 {
 	size_t local_resp_len = resp_len ? *resp_len : 0;
-	int ret = virtio_media_kick_command(vv, sgs, out_sgs, in_sgs,
-					    &local_resp_len);
+	int ret;
+
+	if (vv->disconnected)
+		return -ENODEV;
+	ret = virtio_media_kick_command(vv, sgs, out_sgs, in_sgs,
+				       &local_resp_len);
 	if (resp_len)
 		*resp_len = local_resp_len;
 
@@ -512,6 +558,10 @@ void virtio_media_process_events(struct virtio_media *vv)
 	unsigned int len;
 
 	mutex_lock(&vv->events_lock);
+	if (READ_ONCE(vv->disconnected)) {
+		mutex_unlock(&vv->events_lock);
+		return;
+	}
 
 process_bufs:
 	while ((evt = virtqueue_get_buf(vv->eventq, &len))) {
@@ -542,7 +592,8 @@ process_bufs:
 			v4l2_err(&vv->v4l2_dev,
 				 "received error %d for session %d",
 				 error_evt->errno, error_evt->hdr.session_id);
-			virtio_media_session_close(vv, session);
+			WRITE_ONCE(session->error, true);
+			wake_up_all(&session->dqbuf_wait);
 			break;
 
 		/*
@@ -627,17 +678,15 @@ static int virtio_media_device_open(struct file *file)
 	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp_open),
 					NULL);
 	session_id = resp_open->session_id;
+	if (!ret) {
+		session = virtio_media_session_alloc(vv, session_id, file);
+		if (IS_ERR(session))
+			ret = PTR_ERR(session);
+		else
+			file->private_data = &session->fh;
+	}
 	mutex_unlock(&vv->vlock);
-	if (ret < 0)
-		return ret;
-
-	session = virtio_media_session_alloc(vv, session_id, file);
-	if (IS_ERR(session))
-		return PTR_ERR(session);
-
-	file->private_data = &session->fh;
-
-	return 0;
+	return ret;
 }
 
 /**
@@ -681,6 +730,9 @@ static __poll_t virtio_media_device_poll(struct file *file, poll_table *wait)
 
 	poll_wait(file, &session->dqbuf_wait, wait);
 	poll_wait(file, &session->fh.wait, wait);
+	if (READ_ONCE(to_virtio_media(video_devdata(file))->disconnected) ||
+	    READ_ONCE(session->error))
+		return EPOLLERR | EPOLLHUP;
 
 	mutex_lock(&session->queues_lock);
 	if (req_events & (EPOLLIN | EPOLLRDNORM)) {
@@ -730,12 +782,18 @@ static void virtio_media_munmap_locked(struct virtio_media *vv, u64 driver_addr)
 	}
 }
 
-static void virtio_media_vma_close_locked(struct vm_area_struct *vma)
-{
-	struct virtio_media *vv = vma->vm_private_data;
 
-	virtio_media_munmap_locked(vv,
-		(vma->vm_pgoff << PAGE_SHIFT) - vv->mmap_region.addr);
+struct virtio_media_mapping {
+	refcount_t refs;
+	struct virtio_media *vv;
+	u64 offset;
+};
+
+static void virtio_media_vma_open(struct vm_area_struct *vma)
+{
+	struct virtio_media_mapping *mapping = vma->vm_private_data;
+
+	refcount_inc(&mapping->refs);
 }
 
 /**
@@ -747,14 +805,21 @@ static void virtio_media_vma_close_locked(struct vm_area_struct *vma)
  */
 static void virtio_media_vma_close(struct vm_area_struct *vma)
 {
-	struct virtio_media *vv = vma->vm_private_data;
+	struct virtio_media_mapping *mapping = vma->vm_private_data;
+	struct virtio_media *vv = mapping->vv;
 
+	if (!refcount_dec_and_test(&mapping->refs))
+		return;
 	mutex_lock(&vv->vlock);
-	virtio_media_vma_close_locked(vma);
+	vv->mappings--;
+	if (!vv->disconnected)
+		virtio_media_munmap_locked(vv, mapping->offset);
 	mutex_unlock(&vv->vlock);
+	kfree(mapping);
 }
 
 static const struct vm_operations_struct virtio_media_vm_ops = {
+	.open = virtio_media_vma_open,
 	.close = virtio_media_vma_close,
 };
 
@@ -777,6 +842,7 @@ static int virtio_media_device_mmap(struct file *file,
 	struct virtio_media_resp_mmap *resp_mmap = &session->resp.mmap;
 	struct scatterlist cmd_sg = {}, resp_sg = {};
 	struct scatterlist *sgs[2] = { &cmd_sg, &resp_sg };
+	struct virtio_media_mapping *mapping;
 	int ret;
 
 	if (!(vma->vm_flags & VM_SHARED))
@@ -823,7 +889,6 @@ static int virtio_media_device_mmap(struct file *file,
 		ret = -EINVAL;
 		goto end;
 	}
-	vma->vm_private_data = vv;
 	/*
 	 * Keep the guest address at which the buffer is mapped since we will
 	 * use that to unmap.
@@ -837,20 +902,35 @@ static int virtio_media_device_mmap(struct file *file,
 	if (vma->vm_end - vma->vm_start > PAGE_ALIGN(resp_mmap->len)) {
 		dev_dbg(&video_dev->dev,
 			"invalid MMAP, as it would overflow buffer length\n");
-		virtio_media_vma_close_locked(vma);
+		virtio_media_munmap_locked(vv, resp_mmap->driver_addr);
 		ret = -EINVAL;
 		goto end;
 	}
+	mapping = kzalloc(sizeof(*mapping), GFP_KERNEL);
+	if (!mapping) {
+		ret = -ENOMEM;
+		goto unmap;
+	}
+	refcount_set(&mapping->refs, 1);
+	mapping->vv = vv;
+	mapping->offset = resp_mmap->driver_addr;
 
 	ret = io_remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
 				 vma->vm_end - vma->vm_start,
 				 vma->vm_page_prot);
 	if (ret) {
-		virtio_media_vma_close_locked(vma);
-		goto end;
+		goto free_mapping;
 	}
 
+	vma->vm_private_data = mapping;
 	vma->vm_ops = &virtio_media_vm_ops;
+	vv->mappings++;
+	goto end;
+
+free_mapping:
+	kfree(mapping);
+unmap:
+	virtio_media_munmap_locked(vv, resp_mmap->driver_addr);
 
 end:
 	mutex_unlock(&vv->vlock);
@@ -865,6 +945,15 @@ static const struct v4l2_file_operations virtio_media_fops = {
 	.unlocked_ioctl = virtio_media_device_ioctl,
 	.mmap = virtio_media_device_mmap,
 };
+
+static void virtio_media_release(struct v4l2_device *v4l2_dev)
+{
+	struct virtio_media *vv =
+		container_of(v4l2_dev, struct virtio_media, v4l2_dev);
+
+	kfree(vv->event_buffer);
+	kfree(vv);
+}
 
 static int virtio_media_probe(struct virtio_device *virtio_dev)
 {
@@ -893,21 +982,24 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 	int i;
 	int ret;
 
-	vv = devm_kzalloc(dev, sizeof(*vv), GFP_KERNEL);
+	vv = kzalloc(sizeof(*vv), GFP_KERNEL);
 	if (!vv)
 		return -ENOMEM;
 
-	vv->event_buffer = devm_kzalloc(dev,
+	vv->event_buffer = kzalloc(
 					VIRTIO_MEDIA_EVENT_MAX_SIZE *
 					VIRTIO_MEDIA_NUM_EVENT_BUFS,
 					GFP_KERNEL);
-	if (!vv->event_buffer)
+	if (!vv->event_buffer) {
+		kfree(vv);
 		return -ENOMEM;
+	}
 
 	INIT_LIST_HEAD(&vv->sessions);
 	mutex_init(&vv->sessions_lock);
 	mutex_init(&vv->events_lock);
 	mutex_init(&vv->vlock);
+	mutex_init(&vv->command_lock);
 
 	vv->virtio_dev = virtio_dev;
 	virtio_dev->priv = vv;
@@ -915,8 +1007,12 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 	init_waitqueue_head(&vv->wq);
 
 	ret = v4l2_device_register(dev, &vv->v4l2_dev);
-	if (ret)
+	if (ret) {
+		kfree(vv->event_buffer);
+		kfree(vv);
 		return ret;
+	}
+	vv->v4l2_dev.release = virtio_media_release;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
 	ret = virtio_find_vqs(virtio_dev, 2, vqs, vq_info, NULL);
@@ -970,12 +1066,16 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 	return 0;
 
 err_send_event_buffer:
-	virtio_reset_device(virtio_dev);
+	virtio_media_stop_queues(vv);
+	mutex_lock(&vv->vlock);
 	video_unregister_device(&vv->video_dev);
+	mutex_unlock(&vv->vlock);
+	goto err_find_vqs;
 err_register_device:
 	virtio_dev->config->del_vqs(virtio_dev);
 err_find_vqs:
 	v4l2_device_unregister(&vv->v4l2_dev);
+	v4l2_device_put(&vv->v4l2_dev);
 
 	return ret;
 }
@@ -983,21 +1083,14 @@ err_find_vqs:
 static void virtio_media_remove(struct virtio_device *virtio_dev)
 {
 	struct virtio_media *vv = virtio_dev->priv;
-	struct list_head *p, *n;
-
-	cancel_work_sync(&vv->eventq_work);
-	virtio_reset_device(virtio_dev);
-
-	v4l2_device_unregister(&vv->v4l2_dev);
-	virtio_dev->config->del_vqs(virtio_dev);
+	virtio_media_stop_queues(vv);
+	/* Drain command users and session creation before unregistering V4L2. */
+	mutex_lock(&vv->vlock);
+	mutex_unlock(&vv->vlock);
 	video_unregister_device(&vv->video_dev);
-
-	list_for_each_safe(p, n, &vv->sessions) {
-		struct virtio_media_session *s =
-			list_entry(p, struct virtio_media_session, list);
-
-		virtio_media_session_free(vv, s);
-	}
+	v4l2_device_unregister(&vv->v4l2_dev);
+	/* Open source files (including exports) retain sessions and this device. */
+	v4l2_device_put(&vv->v4l2_dev);
 }
 
 static struct virtio_device_id id_table[] = {
