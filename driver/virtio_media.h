@@ -58,6 +58,7 @@ struct virtio_media {
 	void *event_buffer;
 
 	struct list_head sessions;
+	struct list_head exports; /* weak identities, serialized by vlock */
 	unsigned int mappings; /* live original MMAP requests, under vlock */
 	struct mutex sessions_lock; /* protects sessions list */
 
@@ -89,6 +90,8 @@ int virtio_media_send_command(struct virtio_media *vv, struct scatterlist **sgs,
 			      const size_t out_sgs, const size_t in_sgs,
 			      size_t minimum_resp_len, size_t *resp_len);
 void virtio_media_process_events(struct virtio_media *vv);
+int virtio_media_expbuf(struct file *file, void *fh,
+			struct v4l2_exportbuffer *b);
 
 /* virtio_media_ioctls.c */
 

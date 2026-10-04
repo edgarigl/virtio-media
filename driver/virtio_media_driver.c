@@ -7,6 +7,7 @@
  */
 
 #include <linux/delay.h>
+#include <linux/dma-buf.h>
 #include <linux/device.h>
 #include <linux/dev_printk.h>
 #include <linux/ktime.h>
@@ -25,6 +26,9 @@
 #include <linux/virtio.h>
 #include <linux/virtio_config.h>
 #include <linux/virtio_ids.h>
+#ifdef VIRTIO_MEDIA_SHM_EXPORT
+#include <linux/virtio_shm_export.h>
+#endif
 
 #include <media/frame_vector.h>
 #include <media/v4l2-dev.h>
@@ -782,11 +786,155 @@ static void virtio_media_munmap_locked(struct virtio_media *vv, u64 driver_addr)
 	}
 }
 
+#ifdef VIRTIO_MEDIA_SHM_EXPORT
+struct virtio_media_export {
+	struct list_head list;
+	struct virtio_media *vv;
+	struct file *source;
+	struct dma_buf *dbuf;
+	u32 session_id;
+	u32 type;
+	u32 index;
+	u32 plane;
+	int flags;
+	u64 offset;
+};
+
+static void virtio_media_export_release(void *data)
+{
+	struct virtio_media_export *export = data;
+	struct virtio_media *vv = export->vv;
+
+	mutex_lock(&vv->vlock);
+	list_del(&export->list);
+	if (!vv->disconnected)
+		virtio_media_munmap_locked(vv, export->offset);
+	mutex_unlock(&vv->vlock);
+	/* Retain the source session/queue until its last exported plane is gone. */
+	fput(export->source);
+	kfree(export);
+}
+#endif
+
+int virtio_media_expbuf(struct file *file, void *fh,
+			struct v4l2_exportbuffer *b)
+{
+#ifdef VIRTIO_MEDIA_SHM_EXPORT
+	struct virtio_media *vv = to_virtio_media(video_devdata(file));
+	struct virtio_media_session *session = fh_to_session(file->private_data);
+	struct virtio_media_cmd_mmap *cmd = &session->cmd.mmap;
+	struct virtio_media_resp_mmap *resp = &session->resp.mmap;
+	struct virtio_media_export *export;
+	struct v4l2_plane planes[VIDEO_MAX_PLANES] = {};
+	struct v4l2_buffer query = { .type = b->type, .index = b->index,
+		.memory = V4L2_MEMORY_MMAP };
+	struct scatterlist out = {}, in = {};
+	struct scatterlist *sgs[] = { &out, &in };
+	struct dma_buf *dbuf;
+	u64 length;
+	u32 offset;
+	int ret, fd;
+
+	/* Called with vlock held by the ioctl dispatcher. */
+	if (b->flags & ~(O_CLOEXEC | O_ACCMODE) ||
+	    (b->flags & O_ACCMODE) == O_ACCMODE ||
+	    !V4L2_TYPE_IS_CAPTURE(b->type) ||
+	    b->type > VIRTIO_MEDIA_LAST_QUEUE ||
+	    b->index >= session->queues[b->type].allocated_bufs)
+		return -EINVAL;
+	fd = get_unused_fd_flags(b->flags & O_CLOEXEC);
+	if (fd < 0)
+		return fd;
+	list_for_each_entry(export, &vv->exports, list) {
+		if (export->session_id == session->id && export->type == b->type &&
+		    export->index == b->index && export->plane == b->plane &&
+		    export->flags == (b->flags & O_ACCMODE) &&
+		    get_file_active(&export->dbuf->file)) {
+			fd_install(fd, export->dbuf->file);
+			b->fd = fd;
+			return 0;
+		}
+	}
+	if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
+		query.length = VIDEO_MAX_PLANES;
+		query.m.planes = planes;
+	}
+	ret = virtio_media_ioctl_ops.vidioc_querybuf(file, fh, &query);
+	if (ret)
+		goto unused_fd;
+	if (query.memory != V4L2_MEMORY_MMAP ||
+	    b->plane >= (V4L2_TYPE_IS_MULTIPLANAR(b->type) ? query.length : 1)) {
+		ret = -EINVAL;
+		goto unused_fd;
+	}
+	if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
+		offset = planes[b->plane].m.mem_offset;
+		length = planes[b->plane].length;
+	} else {
+		offset = query.m.offset;
+		length = query.length;
+	}
+	cmd->hdr.cmd = VIRTIO_MEDIA_CMD_MMAP;
+	cmd->session_id = session->id;
+	cmd->flags = (b->flags & O_ACCMODE) != O_RDONLY ?
+		VIRTIO_MEDIA_MMAP_FLAG_RW : 0;
+	cmd->offset = offset;
+	sg_init_one(&out, cmd, sizeof(*cmd));
+	sg_init_one(&in, resp, sizeof(*resp));
+	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp), NULL);
+	if (ret)
+		goto unused_fd;
+	if (!length || length > resp->len ||
+	    !IS_ALIGNED(resp->driver_addr, PAGE_SIZE) ||
+	    resp->driver_addr > vv->mmap_region.len ||
+	    resp->len > vv->mmap_region.len - resp->driver_addr ||
+	    resp->len > U64_MAX - (PAGE_SIZE - 1) ||
+	    PAGE_ALIGN(resp->len) > vv->mmap_region.len - resp->driver_addr) {
+		ret = -EINVAL;
+		goto unmap;
+	}
+	export = kzalloc(sizeof(*export), GFP_KERNEL);
+	if (!export) {
+		ret = -ENOMEM;
+		goto unmap;
+	}
+	export->vv = vv;
+	export->source = get_file(file);
+	export->session_id = session->id;
+	export->type = b->type;
+	export->index = b->index;
+	export->plane = b->plane;
+	export->flags = b->flags & O_ACCMODE;
+	export->offset = resp->driver_addr;
+	dbuf = virtio_shm_export(vv->virtio_dev, VIRTIO_MEDIA_SHM_MMAP,
+				 resp->driver_addr, resp->len, export->flags,
+				 virtio_media_export_release, export);
+	if (IS_ERR(dbuf)) {
+		ret = PTR_ERR(dbuf);
+		fput(export->source);
+		kfree(export);
+		goto unmap;
+	}
+	export->dbuf = dbuf;
+	list_add_tail(&export->list, &vv->exports);
+	fd_install(fd, dbuf->file);
+	b->fd = fd;
+	return 0;
+unmap:
+	virtio_media_munmap_locked(vv, resp->driver_addr);
+unused_fd:
+	put_unused_fd(fd);
+	return ret;
+#else
+	return -EOPNOTSUPP;
+#endif
+}
 
 struct virtio_media_mapping {
 	refcount_t refs;
 	struct virtio_media *vv;
 	u64 offset;
+	struct dma_buf *backing;
 };
 
 static void virtio_media_vma_open(struct vm_area_struct *vma)
@@ -815,6 +963,10 @@ static void virtio_media_vma_close(struct vm_area_struct *vma)
 	if (!vv->disconnected)
 		virtio_media_munmap_locked(vv, mapping->offset);
 	mutex_unlock(&vv->vlock);
+#ifdef VIRTIO_MEDIA_SHM_EXPORT
+	if (mapping->backing)
+		dma_buf_put(mapping->backing);
+#endif
 	kfree(mapping);
 }
 
@@ -914,6 +1066,18 @@ static int virtio_media_device_mmap(struct file *file,
 	refcount_set(&mapping->refs, 1);
 	mapping->vv = vv;
 	mapping->offset = resp_mmap->driver_addr;
+#ifdef VIRTIO_MEDIA_SHM_EXPORT
+	/* An optional backing reference pins provider pages through removal. */
+	mapping->backing = virtio_shm_export(vv->virtio_dev,
+		VIRTIO_MEDIA_SHM_MMAP, mapping->offset, resp_mmap->len,
+		(vma->vm_flags & VM_WRITE) ? O_RDWR : O_RDONLY, NULL, NULL);
+	if (IS_ERR(mapping->backing)) {
+		ret = PTR_ERR(mapping->backing);
+		mapping->backing = NULL;
+		if (ret != -EOPNOTSUPP)
+			goto free_mapping;
+	}
+#endif
 
 	ret = io_remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
 				 vma->vm_end - vma->vm_start,
@@ -928,6 +1092,10 @@ static int virtio_media_device_mmap(struct file *file,
 	goto end;
 
 free_mapping:
+#ifdef VIRTIO_MEDIA_SHM_EXPORT
+	if (mapping->backing)
+		dma_buf_put(mapping->backing);
+#endif
 	kfree(mapping);
 unmap:
 	virtio_media_munmap_locked(vv, resp_mmap->driver_addr);
@@ -996,6 +1164,7 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 	}
 
 	INIT_LIST_HEAD(&vv->sessions);
+	INIT_LIST_HEAD(&vv->exports);
 	mutex_init(&vv->sessions_lock);
 	mutex_init(&vv->events_lock);
 	mutex_init(&vv->vlock);
@@ -1116,3 +1285,6 @@ MODULE_DEVICE_TABLE(virtio, id_table);
 MODULE_DESCRIPTION("virtio media driver");
 MODULE_AUTHOR("Alexandre Courbot <gnurou@gmail.com>");
 MODULE_LICENSE("Dual BSD/GPL");
+#ifdef VIRTIO_MEDIA_SHM_EXPORT
+MODULE_IMPORT_NS("DMA_BUF");
+#endif

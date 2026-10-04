@@ -1182,7 +1182,7 @@ const struct v4l2_ioctl_ops virtio_media_ioctl_ops = {
 	.vidioc_reqbufs = virtio_media_reqbufs,
 	.vidioc_querybuf = virtio_media_querybuf,
 	.vidioc_qbuf = virtio_media_qbuf,
-	.vidioc_expbuf = NULL,
+	.vidioc_expbuf = virtio_media_expbuf,
 	.vidioc_dqbuf = virtio_media_dqbuf,
 	.vidioc_create_bufs = virtio_media_create_bufs,
 	.vidioc_prepare_buf = virtio_media_prepare_buf,
@@ -1313,8 +1313,8 @@ long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
 		ret = -ENODEV;
 		goto unlock;
 	}
-	/* Keep mapped slots owned until their last reference releases. */
-	if (vv->mappings &&
+	/* Keep mapped/exported slots owned until their last reference releases. */
+	if ((vv->mappings || !list_empty(&vv->exports)) &&
 	    (cmd == VIDIOC_REQBUFS || cmd == VIDIOC_CREATE_BUFS ||
 	     cmd == VIDIOC_S_FMT || cmd == VIDIOC_S_INPUT || cmd == VIDIOC_S_STD)) {
 		ret = -EBUSY;
