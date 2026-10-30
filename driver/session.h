@@ -29,7 +29,11 @@
  * @planes: backing planes array for @buffer.
  * @list: link into the list of buffers pending dequeue.
  */
+struct virtio_shm_import;
+
 struct virtio_media_buffer {
+	struct virtio_shm_import *imports[VIDEO_MAX_PLANES];
+	u8 uuids[VIDEO_MAX_PLANES][16];
 	struct v4l2_buffer buffer;
 	struct v4l2_plane planes[VIDEO_MAX_PLANES];
 	struct list_head list;
@@ -38,6 +42,7 @@ struct virtio_media_buffer {
 /**
  * struct virtio_media_queue_state - Represents the state of a V4L2 queue.
  * @streaming: Whether the queue is currently streaming.
+ * @import_needs_cancel: An import QBUF failed; cancel before reusing slots.
  * @allocated_bufs: How many buffers are currently allocated.
  * @is_capture_last: set to true when the last buffer has been received on a
  * capture queue, so we can return -EPIPE on subsequent DQBUF requests.
@@ -46,7 +51,9 @@ struct virtio_media_buffer {
  * @pending_dqbufs: Buffers that are available for being dequeued.
  */
 struct virtio_media_queue_state {
+	u32 memory;
 	bool streaming;
+	bool import_needs_cancel;
 	size_t allocated_bufs;
 	bool is_capture_last;
 

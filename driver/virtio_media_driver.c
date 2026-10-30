@@ -185,8 +185,13 @@ static void virtio_media_session_free(struct virtio_media *vv,
 
 	sg_free_table(&session->command_sgs);
 
-	for (i = 0; i <= VIRTIO_MEDIA_LAST_QUEUE; i++)
+	for (i = 0; i <= VIRTIO_MEDIA_LAST_QUEUE; i++) {
+		unsigned int b;
+
+		for (b = 0; b < session->queues[i].allocated_bufs; b++)
+			virtio_media_release_imports(&session->queues[i].buffers[b]);
 		vfree(session->queues[i].buffers);
+	}
 
 	kfree(session->shadow_buf);
 	kfree(session);
@@ -497,6 +502,14 @@ virtio_media_process_dqbuf_event(struct virtio_media *vv,
 	}
 
 	dqbuf = &queue->buffers[dqbuf_evt->buffer.index];
+	if (!(dqbuf->buffer.flags & V4L2_BUF_FLAG_QUEUED) ||
+	    (dqbuf->buffer.flags & V4L2_BUF_FLAG_DONE) ||
+	    dqbuf_evt->buffer.memory != queue->memory ||
+	    (V4L2_TYPE_IS_MULTIPLANAR(queue_type) &&
+	     dqbuf_evt->buffer.length > VIDEO_MAX_PLANES))
+		return;
+	virtio_media_complete_imports(dqbuf,
+		(dqbuf_evt->buffer.flags & V4L2_BUF_FLAG_ERROR) ? -EIO : 0);
 
 	/*
 	 * Preserve the 'm' union that was passed to us during QBUF so userspace

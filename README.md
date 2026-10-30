@@ -464,3 +464,29 @@ layout will looks as follows:
 | 16 bytes UUID for exported buffer   |
 +-------------------------------------+
 ```
+
+### Optional application-provided capture buffers
+
+With the optional local backing API (`VIRTIO_SHM_INCLUDE`) and a backend
+advertising DMA-BUF capture, this driver supports
+`VIDIOC_REQBUFS(V4L2_MEMORY_DMABUF)` and per-plane DMA-BUFs on `VIDIOC_QBUF`.
+The backing provider handles local attachment, remote object registration,
+reader/writer fences and revocation. The media command contains the protocol's
+16-byte UUID per plane, never a physical address or cross-kernel fd.
+
+Applications must supply linear backing matching the negotiated format and
+stride. Provider address/size restrictions still apply. Each plane needs an
+independent DMA-BUF reservation; shared-fd planes and nonzero capture offsets
+are rejected in this version. `PREPARE_BUF` and `CREATE_BUFS` with DMABUF are
+unsupported. Existing MMAP/EXPBUF capture is retained, and builds without the
+optional API continue to mask the DMABUF capability.
+
+After an imported QBUF command fails, QBUF and STREAMON return EIO until
+STREAMOFF or REQBUFS successfully cancels the previous queue generation.
+This prevents a delayed completion from being applied to a reused buffer
+slot. Failed revocation retains the provider's mapping and fence even if
+the application closes the device.
+
+Run `python3 tests/test-import-queue.py` for the isolated queue-transition
+fixture with ASan/UBSan. It injects command failures and early events into
+the actual ioctl functions; kernel concurrency and real DMA need live tests.

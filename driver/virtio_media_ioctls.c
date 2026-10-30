@@ -280,6 +280,18 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl,
 	if (ret < 0)
 		return ret;
 
+	if (b->memory == V4L2_MEMORY_DMABUF) {
+		struct virtio_media_queue_state *queue = &session->queues[b->type];
+		u32 count = V4L2_TYPE_IS_MULTIPLANAR(b->type) ? b->length : 1;
+
+		if (b->index >= queue->allocated_bufs || !count ||
+		    count > VIDEO_MAX_PLANES)
+			return -EINVAL;
+		ret = scatterlist_builder_add_data(&builder,
+			queue->buffers[b->index].uuids, count * 16);
+		if (ret)
+			return ret;
+	}
 	end_buf_sg = builder.cur_sg;
 
 	/* Payload of SHARED_PAGES buffers, if relevant */
@@ -464,11 +476,14 @@ static void virtio_media_clear_queue(struct virtio_media_session *session,
 	}
 
 	/* All buffers are now dequeued. */
-	for (i = 0; i < queue->allocated_bufs; i++)
+	for (i = 0; i < queue->allocated_bufs; i++) {
+		virtio_media_complete_imports(&queue->buffers[i], -ECANCELED);
 		queue->buffers[i].buffer.flags = 0;
+	}
 
 	queue->queued_bufs = 0;
 	queue->streaming = false;
+	queue->import_needs_cancel = false;
 	queue->is_capture_last = false;
 
 	mutex_unlock(&session->queues_lock);
@@ -702,6 +717,9 @@ static int virtio_media_streamon(struct file *file, void *fh,
 	if (i > VIRTIO_MEDIA_LAST_QUEUE)
 		return -EINVAL;
 
+	if (session->queues[i].import_needs_cancel)
+		return -EIO;
+
 	ret = virtio_media_send_w_ioctl(vfh, VIDIOC_STREAMON, &i, sizeof(i));
 	if (ret < 0)
 		return ret;
@@ -725,7 +743,10 @@ static int virtio_media_streamoff(struct file *file, void *fh,
 	if (ret < 0)
 		return ret;
 
+	virtio_media_process_events(to_virtio_media(vfh->vdev));
+	mutex_lock(&to_virtio_media(vfh->vdev)->events_lock);
 	virtio_media_clear_queue(session, &session->queues[i]);
+	mutex_unlock(&to_virtio_media(vfh->vdev)->events_lock);
 
 	return 0;
 }
@@ -741,12 +762,21 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
 	struct virtio_media_session *session = fh_to_session(vfh);
 	struct virtio_media_queue_state *queue;
 	int ret;
+	unsigned int i;
+	struct virtio_media *vv = to_virtio_media(vfh->vdev);
 
 	if (b->type > VIRTIO_MEDIA_LAST_QUEUE)
 		return -EINVAL;
 
 	if (b->memory == V4L2_MEMORY_USERPTR && !virtio_media_allow_userptr)
 		return -EINVAL;
+
+	queue = &session->queues[b->type];
+	if (queue->streaming && b->count)
+		return -EBUSY;
+	if (b->memory == V4L2_MEMORY_DMABUF &&
+	    (!V4L2_TYPE_IS_CAPTURE(b->type) || !virtio_media_can_import(vv)))
+		return -EOPNOTSUPP;
 
 	ret = virtio_media_send_wr_ioctl(vfh, VIDIOC_REQBUFS, b, sizeof(*b),
 					 sizeof(*b));
@@ -755,9 +785,15 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
 
 	queue = &session->queues[b->type];
 
-	/* REQBUFS(0) is an implicit STREAMOFF. */
-	if (b->count == 0)
-		virtio_media_clear_queue(session, queue);
+	/* Drain already delivered events before replacing the queue generation. */
+	virtio_media_process_events(vv);
+	mutex_lock(&vv->events_lock);
+	for (i = 0; i < queue->allocated_bufs; i++)
+		virtio_media_release_imports(&queue->buffers[i]);
+	queue->memory = b->memory;
+
+	/* Successful reallocation ends the previous queue generation. */
+	virtio_media_clear_queue(session, queue);
 
 	vfree(queue->buffers);
 	queue->buffers = NULL;
@@ -765,11 +801,15 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
 	if (b->count > 0) {
 		queue->buffers =
 			vzalloc(sizeof(struct virtio_media_buffer) * b->count);
-		if (!queue->buffers)
+		if (!queue->buffers) {
+			queue->allocated_bufs = 0;
+			mutex_unlock(&vv->events_lock);
 			return -ENOMEM;
+		}
 	}
 
 	queue->allocated_bufs = b->count;
+	mutex_unlock(&vv->events_lock);
 
 	/*
 	 * If a multiplanar queue is successfully used here, this means
@@ -781,8 +821,8 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
 	if (!virtio_media_allow_userptr)
 		b->capabilities &= ~V4L2_BUF_CAP_SUPPORTS_USERPTR;
 
-	/* We do not support DMABUF yet. */
-	b->capabilities &= ~V4L2_BUF_CAP_SUPPORTS_DMABUF;
+	if (!virtio_media_can_import(vv))
+		b->capabilities &= ~V4L2_BUF_CAP_SUPPORTS_DMABUF;
 
 	return 0;
 }
@@ -827,6 +867,9 @@ static int virtio_media_create_bufs(struct file *file, void *fh,
 	u32 type = b->format.type;
 	int ret;
 
+	if (b->memory == V4L2_MEMORY_DMABUF)
+		return -EOPNOTSUPP;
+
 	if (type > VIRTIO_MEDIA_LAST_QUEUE)
 		return -EINVAL;
 
@@ -855,6 +898,7 @@ static int virtio_media_create_bufs(struct file *file, void *fh,
 	vfree(buffers);
 
 	queue->allocated_bufs = b->index + b->count;
+	queue->memory = b->memory;
 
 	return 0;
 }
@@ -867,6 +911,9 @@ static int virtio_media_prepare_buf(struct file *file, void *fh,
 	struct virtio_media_queue_state *queue;
 	struct virtio_media_buffer *buffer;
 	int i, ret;
+
+	if (b->memory == V4L2_MEMORY_DMABUF)
+		return -EOPNOTSUPP;
 
 	if (b->type > VIRTIO_MEDIA_LAST_QUEUE)
 		return -EINVAL;
@@ -898,6 +945,7 @@ static int virtio_media_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 	struct virtio_media_session *session = fh_to_session(vfh);
 	struct virtio_media_queue_state *queue;
 	struct virtio_media_buffer *buffer;
+	struct virtio_media *vv = to_virtio_media(vfh->vdev);
 	bool prepared;
 	u32 old_flags;
 	int i, ret;
@@ -908,6 +956,16 @@ static int virtio_media_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 	if (b->index >= queue->allocated_bufs)
 		return -EINVAL;
 	buffer = &queue->buffers[b->index];
+	if (queue->import_needs_cancel)
+		return -EIO;
+	if (b->memory != queue->memory ||
+	    buffer->buffer.flags & (V4L2_BUF_FLAG_QUEUED | V4L2_BUF_FLAG_DONE))
+		return -EINVAL;
+	if (b->memory == V4L2_MEMORY_DMABUF) {
+		ret = virtio_media_prepare_imports(vv, buffer, b);
+		if (ret)
+			return ret;
+	}
 	prepared = buffer->buffer.flags & V4L2_BUF_FLAG_PREPARED;
 
 	/*
@@ -925,15 +983,28 @@ static int virtio_media_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 	}
 	old_flags = buffer->buffer.flags;
 	buffer->buffer.flags = V4L2_BUF_FLAG_QUEUED;
+	mutex_lock(&session->queues_lock);
+	queue->queued_bufs++;
+	mutex_unlock(&session->queues_lock);
 
 	ret = virtio_media_send_buffer_ioctl(vfh, VIDIOC_QBUF, b);
 	if (ret) {
-		/* Rollback the previous flags as the buffer is not queued. */
-		buffer->buffer.flags = old_flags;
+		mutex_lock(&vv->events_lock);
+		if (queue->memory == V4L2_MEMORY_DMABUF) {
+			/* Even successful DEL can leave an old completion in flight. */
+			queue->import_needs_cancel = true;
+			virtio_media_release_imports(buffer);
+		}
+		mutex_lock(&session->queues_lock);
+		if (!(buffer->buffer.flags & V4L2_BUF_FLAG_DONE))
+			queue->queued_bufs--;
+		mutex_unlock(&session->queues_lock);
+		/* A completion can arrive before a malformed command response. */
+		if (!(buffer->buffer.flags & V4L2_BUF_FLAG_DONE))
+			buffer->buffer.flags = old_flags;
+		mutex_unlock(&vv->events_lock);
 		return ret;
 	}
-
-	queue->queued_bufs += 1;
 
 	return 0;
 }
@@ -998,7 +1069,7 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
 	mutex_unlock(&session->queues_lock);
 
 	/* Clear the DONE flag as the buffer is now being dequeued. */
-	dqbuf->buffer.flags &= ~V4L2_BUF_FLAG_DONE;
+	dqbuf->buffer.flags &= ~(V4L2_BUF_FLAG_DONE | V4L2_BUF_FLAG_QUEUED);
 
 	if (is_multiplanar) {
 		size_t nb_planes = min_t(u32, b->length, VIDEO_MAX_PLANES);

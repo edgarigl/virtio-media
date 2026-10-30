@@ -93,6 +93,13 @@ void virtio_media_process_events(struct virtio_media *vv);
 int virtio_media_expbuf(struct file *file, void *fh,
 			struct v4l2_exportbuffer *b);
 
+struct virtio_media_buffer;
+bool virtio_media_can_import(struct virtio_media *vv);
+int virtio_media_prepare_imports(struct virtio_media *vv,
+		struct virtio_media_buffer *buffer, struct v4l2_buffer *b);
+void virtio_media_complete_imports(struct virtio_media_buffer *buffer, int error);
+void virtio_media_release_imports(struct virtio_media_buffer *buffer);
+
 /* virtio_media_ioctls.c */
 
 long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
